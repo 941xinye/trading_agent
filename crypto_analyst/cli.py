@@ -92,6 +92,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="watch",
         help="只统计该来源的快照，默认 watch（持续采集，样本最干净）；all 为全量",
     )
+    p_backtest.add_argument(
+        "--replay",
+        action="store_true",
+        help="历史重放：拉取近 N 天真实 K 线与链上/情绪/宏观历史，重建评分快照后回测（需联网）",
+    )
+    p_backtest.add_argument("--days", type=float, default=28.0, help="历史重放天数，默认 28")
+    p_backtest.add_argument(
+        "--step", type=float, default=4.0, help="历史重放采样步长（小时），默认 4"
+    )
 
     p_dash = sub.add_parser("dashboard", help="把落盘快照渲染成静态 HTML 仪表盘（评分走势/维度拆解）")
     p_dash.add_argument("--days", type=int, default=7, help="回看天数，默认 7")
@@ -215,12 +224,32 @@ def _cmd_feishu_hook(args: argparse.Namespace) -> int:
 
 def _cmd_backtest(args: argparse.Namespace) -> int:
     horizons = [float(part) for part in str(args.hours).split(",") if part.strip()]
+    records = None
+    source = args.source
+    if args.replay:
+        from . import replay
+
+        try:
+            records = replay.build_records(days=args.days, step_hours=args.step)
+        except Exception as exc:  # 网络/数据源异常时给出可读提示
+            print(f"历史重放失败：{exc}", file=sys.stderr)
+            return 1
+        if not records:
+            print("历史重放未取到样本，请检查网络、EXCHANGE 与 K 线接口。", file=sys.stderr)
+            return 1
+        source = "replay"
+        print(
+            f"历史重放：{len(records)} 条评分记录"
+            f"（{args.days:g} 天 / 步长 {args.step:g}h，source=replay）"
+        )
+        print("提示：持仓面只重建了资金费率，历史 OI / 多空比不可得，回放时按中性处理。")
     print(
         backtest.run(
             horizon_hours=horizons or 24.0,
-            source=args.source,
+            source=source,
             sweep_weights=args.sweep,
             recommend=args.recommend,
+            records=records,
         )
     )
     return 0

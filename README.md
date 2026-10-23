@@ -158,6 +158,7 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 .venv\Scripts\python.exe main.py backtest --hours 4,24,72    # 多窗口对比
 .venv\Scripts\python.exe main.py backtest --sweep            # 附加权重敏感性扫描
 .venv\Scripts\python.exe main.py backtest --recommend        # 按各维度 IC 给出推荐权重（需 ≥30 个窗口）
+.venv\Scripts\python.exe main.py backtest --replay           # 历史重放：用近 28 天真实数据重建评分样本再回测（需联网）
 .venv\Scripts\python.exe main.py backtest --source all       # 全量来源（含 brief / ask / 调试快照）
 
 # 7) 静态 HTML 仪表盘（生成后直接双击打开，无需服务器）
@@ -177,13 +178,24 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 
 回测采用**非重叠窗口采样**：每个 `horizon` 窗口只取该窗口起点的一条记录作为样本，未来价格必须落在目标时刻 ±0.5×horizon 内，数据断档的窗口直接丢弃。因此样本量口径是"有效窗口数"而非"记录配对数"——挂 `watch` 时每标的每 24h 最多 1 个样本，攒够 30 个窗口（约 10 天 × 3 标的）再解读相关系数才有意义。
 
-输出包含四块：
+`--replay` 不等落盘数据，直接按同一套评分规则重建历史样本：
+
+```powershell
+.venv\Scripts\python.exe main.py backtest --replay --days 28 --step 4 --hours 4,24 --recommend
+```
+
+- 技术面：按 1h/4h/1d 截止该时刻的 K 线重算，完全可复现；
+- 持仓面：只有资金费率可重建（Gate 约 90 条 / 30 天），历史 OI 与多空比接口只保留约 24h，回放按中性处理；
+- 流动性：DeFiLlama 稳定币供应历史；情绪：alternative.me 恐慌贪婪历史；宏观：东方财富指数日线（用上一交易日收盘，避免未来函数）；
+- 重放只用于本次计算，不写入 `.state/snapshots`。
+
+输出包含五块：
 
 1. **状态桶**：按 `REGIME_THRESHOLDS` 分桶，看"偏多/偏空"是否对应正/负收益；
 2. **分位桶**：按综合分排序五等分（Q1 最低 → Q5 最高），样本不足时也不会出现空桶，用于检查收益单调性；
 3. **收益质量**：Pearson r、Spearman IC（秩相关，抗极端值）、整体胜率、均盈/均亏、盈亏比、平均最大不利偏移（MAE，窗口内最低价相对入场价）；
 4. **权重敏感性**（`--sweep`）：各维度权重 ±5pp、其余维度等比缩放后重算总分，观察相关系数变化；某方向能明显提升 r，说明该维度权重偏低；
-5. **权重建议**（`--recommend`）：用同一批非重叠样本分别计算每个维度分数与未来收益的 Spearman IC，按正 IC 占比给出建议权重（非正维度保留 5% 下限），并输出可直接替换的 `DIMENSION_WEIGHTS` 代码块。有效窗口不足 30 个时只展示 IC，不给出建议。
+5. **权重建议**（`--recommend`）：用同一批非重叠样本分别计算每个维度分数与未来收益的 Spearman IC。只有 IC 明显超出抽样噪声带（`1/√n`，且至少再高 5pp）的维度才参与权重分配，其余维度保留 5% 下限、单维度上限 50%，并输出可直接替换的 `DIMENSION_WEIGHTS` 代码块。有效窗口不足 30 个、或所有维度都只有噪声级 IC 时，只展示 IC 而不给建议。
 
 ## 七、配置项（.env）
 

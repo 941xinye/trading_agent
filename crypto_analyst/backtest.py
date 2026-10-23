@@ -30,6 +30,8 @@ QUANTILE_BUCKETS = 5
 WEIGHT_STEP = 0.05
 # 权重建议：单维度最低权重（避免 IC 为负的维度被直接归零）
 MIN_DIM_WEIGHT = 0.05
+# 权重建议：单维度权重上限，避免少数样本把某一维度推到极端
+MAX_DIM_WEIGHT = 0.50
 # 权重建议所需的最少有效窗口数，与回测结论口径保持一致
 MIN_RECOMMEND_SAMPLES = 30
 
@@ -374,8 +376,8 @@ def recommend_weights(
     """按各维度 IC 给出推荐权重。
 
     与回测使用同一批非重叠窗口样本，分别计算「各维度分数 vs 未来收益」的 Spearman IC：
-    IC 为正的维度按比例分配权重，非正维度保留最低权重，避免把某个维度直接归零。
-    样本不足或所有维度 IC 均非正时不给出建议，只回传当前 IC 供观察。
+    只有 IC 明显超出抽样噪声带（约 1/√n，且至少高 5pp）的维度参与权重分配，
+    其余维度保留最低权重；样本不足、或所有维度都只有噪声级 IC 时不给出建议。
     """
     usable = [
         rec
@@ -417,28 +419,50 @@ def recommend_weights(
             ),
         }
 
-    if not any(ic is not None and ic > 0 for ic in ics.values()):
+    # 样本量有限时，Spearman IC 本身有约 1/√n 的抽样噪声；只有明显超出噪声带
+    # （至少再高 MIN_DIM_WEIGHT）的维度才算有效信号，否则给任何权重都是过拟合。
+    noise = 1.0 / (len(pairs) - 1) ** 0.5
+    excess = {
+        dimension: max((ic - noise), 0.0) if ic is not None else 0.0
+        for dimension, ic in ics.items()
+    }
+    if max(excess.values()) < MIN_DIM_WEIGHT:
         return {
             "samples": len(pairs),
             "ready": False,
             "rows": _rows(None),
             "suggested": {},
-            "note": "各维度 IC 均非正，当前样本无法给出可信权重，建议先检查评分规则方向。",
+            "note": (
+                f"各维度 IC 相对噪声带 ±{noise:.2f} 的优势不足 {MIN_DIM_WEIGHT:.0%}"
+                f"（{len(pairs)} 个窗口），当前样本无法区分维度优劣，建议维持现有权重并继续积累数据。"
+            ),
         }
 
     raw = {
-        dimension: max(ic if ic is not None else 0.0, MIN_DIM_WEIGHT)
-        for dimension, ic in ics.items()
+        dimension: max(value, MIN_DIM_WEIGHT) for dimension, value in excess.items()
     }
     total = sum(raw.values())
-    suggested = _round_weights({dimension: value / total for dimension, value in raw.items()})
+    weights = {dimension: value / total for dimension, value in raw.items()}
+
+    # 单维度上限，避免少数样本把某一维度推到极端权重
+    heavy = max(weights, key=lambda dimension: weights[dimension])
+    if weights[heavy] > MAX_DIM_WEIGHT:
+        excess = weights[heavy] - MAX_DIM_WEIGHT
+        weights[heavy] = MAX_DIM_WEIGHT
+        rest = [dimension for dimension in weights if dimension != heavy]
+        rest_total = sum(weights[dimension] for dimension in rest)
+        for dimension in rest:
+            weights[dimension] += excess * weights[dimension] / rest_total
+
+    suggested = _round_weights(weights)
     return {
         "samples": len(pairs),
         "ready": True,
         "rows": _rows(suggested),
         "suggested": suggested,
         "note": (
-            "建议权重按各维度 IC 占比分配，非正维度保留 5% 下限；"
+            f"建议权重按各维度 IC 超出噪声带 {noise:.2f} 的部分占比分配，"
+            f"其余维度保留 {MIN_DIM_WEIGHT:.0%} 下限、单维度上限 {MAX_DIM_WEIGHT:.0%}；"
             "建议先小步调整（每次 5-10pp）并继续积累样本复测。"
         ),
     }
@@ -480,9 +504,10 @@ def run(
     source: str = "watch",
     sweep_weights: bool = False,
     recommend: bool = False,
+    records: list[dict[str, Any]] | None = None,
 ) -> str:
     horizons = _normalize_horizons(horizon_hours)
-    all_records = list(history.iter_records())
+    all_records = records if records is not None else list(history.iter_records())
     if source == "all":
         records = all_records
     else:

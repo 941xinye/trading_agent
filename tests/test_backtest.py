@@ -212,9 +212,22 @@ def test_recommend_weights_uses_dimension_ic():
     rows = {row["dimension"]: row for row in result["rows"]}
     assert rows["technical"]["ic"] == pytest.approx(1.0)
     assert rows["sentiment"]["ic"] == pytest.approx(-1.0)
-    assert rows["technical"]["suggested"] > rows["technical"]["current"]
+    # 单维度封顶 50%（两位小数舍入会有 ±0.02 误差），其余维度均分剩余权重
+    assert rows["technical"]["suggested"] == pytest.approx(backtest.MAX_DIM_WEIGHT, abs=0.03)
     assert rows["sentiment"]["suggested"] < rows["sentiment"]["current"]
     assert sum(result["suggested"].values()) == pytest.approx(1.0)
+
+
+def test_recommend_weights_rejects_ic_within_noise(monkeypatch):
+    fixed = {"technical": 0.05, "positioning": -0.02, "liquidity": 0.03, "sentiment": -0.01, "macro": 0.04}
+    # 用闭包按调用顺序返回，模拟所有维度都只有微弱相关
+    values = iter(fixed.values())
+    monkeypatch.setattr(backtest, "_spearman", lambda xs, ys: next(values))
+
+    result = backtest.recommend_weights(_scored_records(60), horizon_hours=24)
+    assert result["ready"] is False
+    assert "噪声带" in result["note"]
+    assert all(row["suggested"] is None for row in result["rows"])
 
 
 def test_recommend_weights_requires_enough_samples():
