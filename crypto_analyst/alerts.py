@@ -395,18 +395,71 @@ def format_alerts(alerts: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+LEVEL_ORDER = {"info": 1, "warning": 2}
+
+
+def _quiet_window() -> tuple[int, int] | None:
+    raw = config.ALERT_QUIET_HOURS
+    if not raw or "-" not in raw:
+        return None
+    try:
+        start_text, end_text = [part.strip() for part in raw.split("-", 1)]
+        start_h, start_m = (int(part) for part in start_text.split(":"))
+        end_h, end_m = (int(part) for part in end_text.split(":"))
+    except ValueError:
+        return None
+    return start_h * 60 + start_m, end_h * 60 + end_m
+
+
+def in_quiet_hours(now: datetime | None = None) -> bool:
+    """判断当前是否处于夜间静默时段（支持 23:00-07:00 这类跨零点区间）。"""
+    window = _quiet_window()
+    if not window:
+        return False
+    current = now or datetime.now()
+    minutes = current.hour * 60 + current.minute
+    start, end = window
+    if start == end:
+        return False
+    if start < end:
+        return start <= minutes < end
+    return minutes >= start or minutes < end
+
+
+def pushable(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按 ALERT_MIN_LEVEL 过滤：被过滤的告警仍会写入 alerts.log。"""
+    threshold = LEVEL_ORDER.get(config.ALERT_MIN_LEVEL, 1)
+    return [item for item in alerts if LEVEL_ORDER.get(item.get("level", "info"), 1) >= threshold]
+
+
+def run_watch_once() -> list[dict[str, Any]]:
+    """跑一轮采集 + 告警评估 + 落盘/推送，供 watch 与内置调度共用。"""
+    snapshot = analysis.build_snapshot(include_news=False, source="watch")
+    fired = evaluate(snapshot)
+    text = format_alerts(fired)
+    print(text, flush=True)
+    if fired:
+        append_alert_log(text)
+        if in_quiet_hours():
+            print("[静默时段] 本轮告警已落盘，未推送。", flush=True)
+        else:
+            due = pushable(fired)
+            if due:
+                push(format_alerts(due))
+            else:
+                print("[级别过滤] 告警均低于 ALERT_MIN_LEVEL，仅落盘。", flush=True)
+    return fired
+
+
 def run_watch(interval: int | None = None, once: bool = False) -> None:
     interval = interval or config.ALERT_INTERVAL
-    print(f"异动监控启动，轮询间隔 {interval}s，冷却 {config.ALERT_COOLDOWN}s（Ctrl+C 退出）")
+    print(
+        f"异动监控启动，轮询间隔 {interval}s，冷却 {config.ALERT_COOLDOWN}s，"
+        f"静默时段 {config.ALERT_QUIET_HOURS or '未启用'}，最低推送级别 {config.ALERT_MIN_LEVEL}（Ctrl+C 退出）"
+    )
     while True:
         try:
-            snapshot = analysis.build_snapshot(include_news=False, source="watch")
-            alerts = evaluate(snapshot)
-            text = format_alerts(alerts)
-            print(text, flush=True)
-            if alerts:
-                append_alert_log(text)
-                push(text)
+            run_watch_once()
         except KeyboardInterrupt:
             print("\n已停止监控。")
             return

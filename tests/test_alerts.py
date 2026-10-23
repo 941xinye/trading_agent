@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+from datetime import datetime
 
 import pytest
 
@@ -114,6 +115,37 @@ def test_previous_regimes_ignores_other_sources(monkeypatch):
         ),
     )
     assert alerts._previous_regimes("watch") == {"BTC": "偏空"}
+
+
+def test_quiet_hours_cross_midnight(monkeypatch):
+    monkeypatch.setattr(config, "ALERT_QUIET_HOURS", "23:00-07:00")
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 23, 30)) is True
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 6, 59)) is True
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 7, 0)) is False
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 12, 0)) is False
+
+
+def test_quiet_hours_within_same_day(monkeypatch):
+    monkeypatch.setattr(config, "ALERT_QUIET_HOURS", "12:00-13:30")
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 12, 0)) is True
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 13, 29)) is True
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 13, 30)) is False
+
+
+def test_quiet_hours_disabled_or_invalid(monkeypatch):
+    monkeypatch.setattr(config, "ALERT_QUIET_HOURS", "")
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 23, 30)) is False
+    monkeypatch.setattr(config, "ALERT_QUIET_HOURS", "bad-value")
+    assert alerts.in_quiet_hours(datetime(2026, 10, 24, 23, 30)) is False
+
+
+def test_pushable_filters_by_min_level(monkeypatch):
+    monkeypatch.setattr(config, "ALERT_MIN_LEVEL", "warning")
+    items = [{"level": "info"}, {"level": "warning"}, {"level": "warning"}]
+    assert alerts.pushable(items) == items[1:]
+
+    monkeypatch.setattr(config, "ALERT_MIN_LEVEL", "info")
+    assert alerts.pushable(items) == items
 
 
 def test_cooldown_blocks_repeat_and_prefixes_exchange(monkeypatch, snapshot_factory):

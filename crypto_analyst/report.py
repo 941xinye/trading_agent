@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from . import analysis, config
+from . import analysis, config, history
 from .providers import market
 
 TREND_LABELS = {"up": "多头", "down": "空头", "range": "震荡"}
@@ -46,6 +46,59 @@ def _compact_usd(value: float | None) -> str:
     if value >= 1e6:
         return f"${value / 1e6:.1f}M"
     return f"${value:,.0f}"
+
+
+def score_baselines(snapshot: analysis.MarketSnapshot, records=None) -> dict[str, dict[str, Any]]:
+    """取每个标的"上一次"与"约 24h 前"的历史评分，用于结论速览里的变化对比。
+
+    快照自身会在 build 阶段落盘，比较时按 generated_at 排除同一时刻的记录，
+    避免拿自己和自己比。
+    """
+    all_records = list(records if records is not None else history.iter_records())
+    try:
+        now = datetime.strptime(snapshot.generated_at, "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        now = datetime.now().timestamp()
+
+    baselines: dict[str, dict[str, Any]] = {}
+    for item in snapshot.symbols:
+        usable = [
+            rec
+            for rec in all_records
+            if rec.get("symbol") == item.symbol
+            and rec.get("epoch")
+            and rec.get("ts") != snapshot.generated_at
+            and now - rec["epoch"] >= 60
+        ]
+        if not usable:
+            baselines[item.symbol] = {"last": None, "day": None}
+            continue
+
+        last = max(usable, key=lambda rec: rec["epoch"])
+        if now - last["epoch"] > 12 * 3600:
+            last = None
+
+        day_candidates = [
+            rec for rec in usable if abs(rec["epoch"] - (now - 86400)) <= 8 * 3600
+        ]
+        day = (
+            min(day_candidates, key=lambda rec: abs(rec["epoch"] - (now - 86400)))
+            if day_candidates
+            else None
+        )
+        if day is not None and last is not None and day["epoch"] == last["epoch"]:
+            day = None
+        baselines[item.symbol] = {"last": last, "day": day}
+    return baselines
+
+
+def _delta_text(item: analysis.SymbolSnapshot, base: dict[str, Any] | None) -> str:
+    if not base or base.get("total_score") is None:
+        return "—"
+    text = f"{item.total_score - base['total_score']:+.1f}"
+    if base.get("regime") and base["regime"] != item.regime:
+        text += f" · {base['regime']}→{item.regime}"
+    return text
 
 
 def _one_liner(item: analysis.SymbolSnapshot) -> str:
@@ -223,6 +276,7 @@ def generate(
     snapshot: analysis.MarketSnapshot,
     commentary: str | None = None,
     title: str = "加密市场行情简报",
+    baselines: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append(f"# {title}")
@@ -235,13 +289,25 @@ def generate(
     lines.append("")
     lines.append("## 一、结论速览")
     lines.append("")
-    lines.append("| 标的 | 最新价 | 24h | 综合分 | 状态 | 关键信号 |")
-    lines.append("| --- | --- | --- | --- | --- | --- |")
-    for item in snapshot.symbols:
-        lines.append(
-            f"| {item.symbol} | {_price(item.price)} | {_pct(item.change_24h_pct)} | "
-            f"{item.total_score:.1f} | {item.regime} | {_one_liner(item)} |"
-        )
+    if baselines is None:
+        lines.append("| 标的 | 最新价 | 24h | 综合分 | 状态 | 关键信号 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for item in snapshot.symbols:
+            lines.append(
+                f"| {item.symbol} | {_price(item.price)} | {_pct(item.change_24h_pct)} | "
+                f"{item.total_score:.1f} | {item.regime} | {_one_liner(item)} |"
+            )
+    else:
+        lines.append("| 标的 | 最新价 | 24h | 综合分 | 状态 | 较上次 | 较昨日 | 关键信号 |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for item in snapshot.symbols:
+            base = baselines.get(item.symbol) or {}
+            lines.append(
+                f"| {item.symbol} | {_price(item.price)} | {_pct(item.change_24h_pct)} | "
+                f"{item.total_score:.1f} | {item.regime} | "
+                f"{_delta_text(item, base.get('last'))} | {_delta_text(item, base.get('day'))} | "
+                f"{_one_liner(item)} |"
+            )
     lines.append("")
     if commentary:
         quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in commentary.strip().splitlines())

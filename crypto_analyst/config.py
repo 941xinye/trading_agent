@@ -87,3 +87,9 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 ALERT_INTERVAL = int(os.getenv("ALERT_INTERVAL", "300"))
 ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "1800"))
+# 夜间静默时段（本地时区，支持跨零点如 23:00-07:00，留空不启用）：期间告警只落盘不推送
+ALERT_QUIET_HOURS = os.getenv("ALERT_QUIET_HOURS", "").strip()
+# 最低推送级别：info 全部推送；warning 只推 warning，info 仍会落盘
+ALERT_MIN_LEVEL = os.getenv("ALERT_MIN_LEVEL", "info").strip().lower()
+# 内置调度（main.py serve）的每日简报推送时间，24 小时制、逗号分隔
+BRIEF_PUSH_TIMES = os.getenv("BRIEF_PUSH_TIMES", "09:00,21:00").strip()

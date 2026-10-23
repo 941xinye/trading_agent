@@ -22,10 +22,11 @@
 | 情绪面 | 恐慌贪婪指数（当前值、1d/7d 变化、30日均值）+ 加密快讯 | alternative.me、Cointelegraph/Decrypt RSS |
 | 宏观联动 | 美元指数、纳斯达克100、标普500 的点位与 1d/5d 涨跌 | 东方财富公开行情 |
 
-三类交互方式 + 一条推送通道全部实现：
+四类交互方式 + 一条推送通道全部实现：
 
-- **定时简报** `brief`：生成 Markdown 简报并落盘，可接系统计划任务；
-- **对话问答** `ask`：LLM 自主调用 7 个数据工具后作答；
+- **定时简报** `brief`：生成 Markdown 简报并落盘，结论速览自动带「较上次 / 较昨日」评分与状态变化；
+- **对话问答** `ask`：LLM 自主调用 7 个数据工具后作答；`ask -i` 进入多轮对话，上下文保留最近 3 轮；
+- **仪表盘** `dashboard`：把落盘快照渲染成静态 HTML（评分走势 + 五维拆解），本地直接打开；
 - **异动告警** `watch`：阈值触发 + 冷却去重 + Webhook 推送，覆盖 24h 异动 / RSI 超买卖 / 支撑阻力测试与突破 / 资金费率拥挤与极端分位 / 持仓量异动 / 量能放大 / 评分状态切换 / 恐慌贪婪极端值 / 稳定币流出；
 - **飞书推送** `push-test` / `brief --push`：支持飞书自定义机器人 text 与 interactive 卡片消息，可选 HmacSHA256 加签。
 
@@ -62,6 +63,7 @@ macro.py     ─┘                                   ├─> alerts.py  ──>
 │  ├─ analysis.py           # 快照与五维评分
 │  ├─ history.py            # 评分快照落盘（回测数据源，带 source 标记）
 │  ├─ backtest.py           # 非重叠窗口回测（综合分 vs 未来收益）
+│  ├─ dashboard.py          # 静态 HTML 仪表盘（内联 SVG，无外部依赖）
 │  ├─ tools.py              # Agent 工具层（支持 ask --symbols 作用域）
 │  ├─ agent.py              # LLM 工具调用循环
 │  ├─ prompts.py            # 人格与分析规范
@@ -71,8 +73,8 @@ macro.py     ─┘                                   ├─> alerts.py  ──>
 │  ├─ cli.py                # 命令行子命令
 │  └─ providers/            # 四类数据源
 │     └─ exchanges/         # 交易所适配：gate.py / binance.py，按 EXCHANGE 切换
-├─ scripts/                 # watch 守护进程 / 简报计划任务批处理
-├─ tests/                   # pytest 单测（indicators / backtest / 评分 / 告警 / 简报）
+├─ scripts/                 # 服务守护脚本（watch + 定时简报）
+├─ tests/                   # pytest 单测（指标 / 回测 / 评分 / 告警 / 简报 / Agent / 仪表盘）
 └─ reports/                 # 简报、告警与运行日志（自动创建）
 ```
 
@@ -131,10 +133,15 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 # 3) 对话问答（需 LLM Key）
 .venv\Scripts\python.exe main.py ask "BTC 现在能追多吗？关键价位在哪"
 .venv\Scripts\python.exe main.py ask "ETH 和 SOL 哪个更强" --symbols ETH,SOL
+.venv\Scripts\python.exe main.py ask -i                       # 多轮对话：/reset 清空上下文，/exit 退出
 
 # 4) 异动监控（先跑一轮验证）
 .venv\Scripts\python.exe main.py watch --once
 .venv\Scripts\python.exe main.py watch --interval 300
+
+# 4.1) 内置调度：异动监控 + 每日定时简报推送（替代 Windows 计划任务）
+.venv\Scripts\python.exe main.py serve --once              # 跑一轮验证
+.venv\Scripts\python.exe main.py serve --interval 300      # 常驻
 
 # 5) 推送链路自检
 .venv\Scripts\python.exe main.py push-test          # 纯文本
@@ -145,6 +152,10 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 .venv\Scripts\python.exe main.py backtest --hours 4,24,72    # 多窗口对比
 .venv\Scripts\python.exe main.py backtest --sweep            # 附加权重敏感性扫描
 .venv\Scripts\python.exe main.py backtest --source all       # 全量来源（含 brief / ask / 调试快照）
+
+# 7) 静态 HTML 仪表盘（生成后直接双击打开，无需服务器）
+.venv\Scripts\python.exe main.py dashboard                   # 默认回看 7 天，输出 reports/dashboard.html
+.venv\Scripts\python.exe main.py dashboard --days 3 --source watch
 ```
 
 每次 `brief` / `watch` / `snapshot` / `ask` 运行后，评分快照会自动追加到 `.state/snapshots/YYYYMMDD.jsonl`（每个标的一行，并带 `source` 标记区分来源）。
@@ -177,7 +188,10 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 | `LLM_API_KEY` | 空 | 留空则只跑规则引擎 |
 | `LLM_MODEL` | `deepseek-chat` | 模型名 |
 | `ALERT_INTERVAL` | 300 | 轮询间隔（秒） |
-| `ALERT_COOLDOWN` | 1800 | 同类告警冷却（秒） |
+| `ALERT_COOLDOWN` | 1800 | 同类告警冷却（秒），按 `交易所:标的:类型` 独立计时 |
+| `ALERT_QUIET_HOURS` | 空 | 夜间静默时段，如 `23:00-07:00`（支持跨零点）；期间告警只写 `alerts.log` 不推送 |
+| `ALERT_MIN_LEVEL` | `info` | 最低推送级别：`info` 全推；`warning` 只推 warning，info 仍落盘 |
+| `BRIEF_PUSH_TIMES` | `09:00,21:00` | `serve` 每日简报推送时间点，24 小时制、逗号分隔 |
 | `WEBHOOK_URL` | 空 | 飞书/钉钉自定义机器人 Webhook，留空不推送；含 `feishu` 或 `larksuite` 判定为飞书 |
 | `WEBHOOK_SECRET` | 空 | 飞书机器人开启「签名校验」时填入 secret，未开启留空 |
 
@@ -210,34 +224,32 @@ Binance 说明：
    - `watch` 监控触发阈值时自动推送文本告警，享受冷却去重；告警同时追加到 `reports/alerts.log`，推送失败也能回溯；
    - 非飞书机器人（如钉钉）自动降级为纯文本。
 
-### 定时推送（Windows 计划任务）
+### 定时推送（内置调度 `serve`）
 
-仓库自带 [scripts/brief_push_task.bat](scripts/brief_push_task.bat) 作为任务入口（**任务本身的注册属于本机状态，不在版本库内**）。本机已注册两条每日任务：
+定时简报由常驻进程 `serve` 负责，不再依赖 Windows 计划任务：
 
-- `CryptoAnalyst\BriefPushMorning`：每日 09:00
-- `CryptoAnalyst\BriefPushEvening`：每日 21:00
-
-执行日志写到 `reports\brief_task.log`。
-
-> **注意：** 这两条任务当前的登录模式是 `Interactive only`（`schtasks /Query /V` 可见），**用户未登录时不会执行**。需要真正无人值守时，要改成"不管用户是否登录都运行"并在任务里配置凭据。
-
-管理命令：
+- 一个进程同时跑「异动监控（默认 300s/轮）」与「每日定时简报推送」；
+- 推送时间读 `BRIEF_PUSH_TIMES`（默认 `09:00,21:00`），也可用 `serve --times 08:30,20:30` 临时覆盖；
+- 每个时间点触发后写入 `.state/serve_slots.json`，进程重启不会重复推送；错过时间点 30 分钟内仍会补发，超过则跳过；
+- 单轮采集/简报失败只打印日志，不影响后续轮询。
 
 ```powershell
-schtasks /Query /TN "CryptoAnalyst\BriefPushMorning"        # 查看状态
-schtasks /Run /TN "CryptoAnalyst\BriefPushMorning"          # 立即触发一次
-schtasks /Delete /TN "CryptoAnalyst\BriefPushMorning" /F    # 删除
+# 前台试跑一轮（监控 + 到点的简报），便于验证
+.venv\Scripts\python.exe main.py serve --once
+
+# 常驻运行（Ctrl+C 退出）
+.venv\Scripts\python.exe main.py serve --interval 300 --times 09:00,21:00
 ```
 
-退出码约定：`0` 表示简报+推送全部成功；`3` 表示简报已落盘但推送失败；`1`/`2` 表示简报本身失败。
+日常推荐用 `scripts\watch_start.ps1` 在后台拉起守护进程，daemon 内部执行的就是 `main.py serve`，因此告警与定时简报共用同一份进程状态，不会重复采集。
 
 ### watch 常驻（攒回测样本）
 
-`watch` 需要长时间挂起才能攒够回测样本（≥30 个有效窗口，约 10 天 × 3 标的）。仓库提供 4 个脚本：
+`serve`（内含 watch 轮询）需要长时间挂起才能攒够回测样本（≥30 个有效窗口，约 10 天 × 3 标的）。仓库提供 4 个脚本：
 
 | 脚本 | 用途 |
 | --- | --- |
-| [scripts/watch_daemon.ps1](scripts/watch_daemon.ps1) | 守护循环本体：自动重启 + 日志轮转 + PID 管理 + 单实例保护 |
+| [scripts/watch_daemon.ps1](scripts/watch_daemon.ps1) | 守护循环本体：执行 `main.py serve`，自动重启 + 日志轮转 + PID 管理 + 单实例保护 |
 | [scripts/watch_start.ps1](scripts/watch_start.ps1) | 以隐藏窗口启动 daemon（当前会话内有效） |
 | [scripts/watch_stop.ps1](scripts/watch_stop.ps1) | 停止 daemon 及其全部子孙进程 |
 | [scripts/watch_register_task.ps1](scripts/watch_register_task.ps1) | 注册"登录自启"；权限不足时自动降级到 Startup 文件夹快捷方式 |
@@ -280,6 +292,8 @@ powershell -File scripts\watch_stop.ps1
 - 回测基于落盘快照做"评分 vs 未来收益"的分桶统计与相关性检验，采用非重叠窗口采样（每窗口一个样本、允许 0.5×horizon 的价格滞后、断档窗口丢弃）。它只能回答"评分当时是否有预测力"，不能替代逐根 K 线的策略回测；后者可在 `backtest.py` 之上扩展。
 - 分位桶在样本 <5 个窗口时不输出，`--sweep` 在带分维度分数的快照 <3 条或无法算出基线 r 时直接跳过——样本越多，权重扫描的结论才越可信。
 - 回测只统计 `source=watch` 的记录（可用 `--source all` 放开），因此样本积累速度受 watch 运行时长限制：3 个标的每天最多 3 个 24h 窗口。
+- 多轮对话为进程内上下文，`Ctrl+C` / `/exit` 后不持久化；超过 25 条消息时从倒数第 3 轮开始截断，避免打断 tool_calls 与 tool 结果的配对。
+- 仪表盘只渲染落盘评分快照（综合分序列），不含 K 线行情；页面为单文件静态 HTML，内联 SVG，可离线归档。
 
 ## 免责声明
 

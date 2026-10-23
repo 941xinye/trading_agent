@@ -5,9 +5,9 @@ import argparse
 import json
 import sys
 
-from . import analysis, alerts, backtest, config, report
+from . import analysis, alerts, backtest, briefing, config
 from .agent import MarketAnalyst
-from .llm import LLMClient, LLMError
+from .llm import LLMError
 from .providers.exchanges import EXCHANGE_NAMES
 
 
@@ -38,12 +38,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_brief.add_argument("--push", action="store_true", help="推送卡片消息到飞书机器人（需配置 WEBHOOK_URL）")
 
     p_ask = sub.add_parser("ask", parents=[exchange], help="对话式提问，Agent 会自主调用数据工具")
-    p_ask.add_argument("question", help="你的问题，例如：BTC 现在能追多吗")
+    p_ask.add_argument("question", nargs="?", help="你的问题，例如：BTC 现在能追多吗")
     p_ask.add_argument("--symbols", help="临时覆盖观察列表")
+    p_ask.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="进入多轮对话模式：/reset 清空上下文，/exit 退出",
+    )
 
     p_watch = sub.add_parser("watch", parents=[exchange], help="轮询监控异动并推送告警")
     p_watch.add_argument("--interval", type=int, help="轮询间隔秒数，默认 300")
     p_watch.add_argument("--once", action="store_true", help="只跑一轮，便于测试")
+
+    p_serve = sub.add_parser(
+        "serve",
+        parents=[exchange],
+        help="内置调度：异动监控 + 每日定时简报推送（替代 schtasks 双任务）",
+    )
+    p_serve.add_argument("--interval", type=int, help="异动轮询间隔秒数，默认 300")
+    p_serve.add_argument(
+        "--times",
+        help="每日简报推送时间，逗号分隔，如 09:00,21:00；默认读 BRIEF_PUSH_TIMES",
+    )
+    p_serve.add_argument("--once", action="store_true", help="只跑一轮监控与到点简报，便于测试")
 
     p_snap = sub.add_parser("snapshot", parents=[exchange], help="输出结构化 JSON 快照（调试/二次开发用）")
     p_snap.add_argument("--symbols", help="逗号分隔的币种")
@@ -70,25 +88,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="只统计该来源的快照，默认 watch（持续采集，样本最干净）；all 为全量",
     )
 
+    p_dash = sub.add_parser("dashboard", help="把落盘快照渲染成静态 HTML 仪表盘（评分走势/维度拆解）")
+    p_dash.add_argument("--days", type=int, default=7, help="回看天数，默认 7")
+    p_dash.add_argument(
+        "--source",
+        choices=["watch", "brief", "snapshot", "ask", "all"],
+        default="all",
+        help="只统计该来源的快照，默认 all",
+    )
+    p_dash.add_argument("--out", help="输出路径，默认 reports/dashboard.html")
+
     return parser
 
 
 def _cmd_brief(args: argparse.Namespace) -> int:
-    snapshot = analysis.build_snapshot(symbols=_parse_symbols(args.symbols), source="brief")
+    snapshot, text, commentary, path = briefing.build(
+        symbols=_parse_symbols(args.symbols),
+        use_llm=not args.no_llm,
+    )
     if not snapshot.symbols:
         print("未获取到任何标的，请检查 CACHE_DIR / 网络。", file=sys.stderr)
         return 1
 
-    commentary = None
-    llm = LLMClient()
-    if not args.no_llm and llm.available:
-        try:
-            commentary = MarketAnalyst(llm).comment(report.facts_for_llm(snapshot))
-        except LLMError as exc:
-            print(f"[提示] 分析师点评生成失败，仅输出规则部分：{exc}", file=sys.stderr)
-
-    text = report.generate(snapshot, commentary=commentary)
-    path = report.save(text)
     if args.stdout:
         print(text)
     print(f"简报已保存：{path}")
@@ -102,14 +123,42 @@ def _cmd_brief(args: argparse.Namespace) -> int:
             push_failed = True
     if snapshot.warnings:
         print("数据缺口：" + "；".join(snapshot.warnings))
-    # 退出码：0 全部成功；3 简报成功但推送失败（便于计划任务区分对待）
+    # 退出码：0 全部成功；3 简报成功但推送失败（便于外部调度区分处理）
     return 3 if push_failed else 0
+
+
+def _interactive_ask(analyst: MarketAnalyst, symbols: list[str] | None) -> int:
+    print("已进入多轮对话：/reset 清空上下文，/exit 退出。")
+    while True:
+        try:
+            question = input("\n你> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not question:
+            continue
+        if question in ("/exit", "/quit"):
+            return 0
+        if question == "/reset":
+            analyst.reset()
+            print("上下文已清空。")
+            continue
+        try:
+            print("\n分析师> " + analyst.chat(question, symbols=symbols))
+        except LLMError as exc:
+            print(str(exc), file=sys.stderr)
 
 
 def _cmd_ask(args: argparse.Namespace) -> int:
     analyst = MarketAnalyst()
+    symbols = _parse_symbols(args.symbols)
+    if args.interactive:
+        return _interactive_ask(analyst, symbols)
+    if not args.question:
+        print("请提供问题（如 `ask \"BTC 现在能追多吗\"`），或用 -i 进入多轮对话。", file=sys.stderr)
+        return 1
     try:
-        answer = analyst.ask(args.question, symbols=_parse_symbols(args.symbols))
+        answer = analyst.ask(args.question, symbols=symbols)
     except LLMError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -117,8 +166,23 @@ def _cmd_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    from . import dashboard
+
+    path = dashboard.save(days=args.days, source=args.source, out=args.out)
+    print(f"仪表盘已生成：{path}")
+    return 0
+
+
 def _cmd_watch(args: argparse.Namespace) -> int:
     alerts.run_watch(interval=args.interval, once=args.once)
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from . import scheduler
+
+    scheduler.serve(interval=args.interval, times=args.times, once=args.once)
     return 0
 
 
@@ -216,9 +280,11 @@ def main(argv: list[str] | None = None) -> int:
         "brief": _cmd_brief,
         "ask": _cmd_ask,
         "watch": _cmd_watch,
+        "serve": _cmd_serve,
         "snapshot": _cmd_snapshot,
         "push-test": _cmd_push_test,
         "backtest": _cmd_backtest,
+        "dashboard": _cmd_dashboard,
     }
     return handlers[args.command](args)
 

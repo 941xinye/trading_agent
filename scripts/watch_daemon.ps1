@@ -1,10 +1,11 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    链析 watch 常驻守护进程：自动重启 + 日志轮转 + PID 管理。
+    链析服务守护进程：内置调度（异动监控 + 每日定时简报）+ 自动重启 + 日志轮转 + PID 管理。
 
 .DESCRIPTION
-    - 每轮调用 main.py watch --interval $Interval，进程退出后按指数退避重启；
+    - 每轮调用 main.py serve --interval $Interval，进程退出后按指数退避重启；
+    - serve 内含 watch 轮询与 BRIEF_PUSH_TIMES 定时简报推送，无需 Windows 计划任务；
     - 日志写入 reports\watch.log，超过 $MaxLogMB 自动归档为 watch.YYYYMMDD-HHmmss.log；
     - PID 写入 .state\watch.pid，供 watch_stop.ps1 精确终止；
     - 单实例运行：发现已有存活实例时直接退出，避免重复采集。
@@ -80,9 +81,9 @@ try {
             exit 2
         }
 
-        Write-Log "启动 python main.py watch --interval $Interval"
+        Write-Log "启动 python main.py serve --interval $Interval"
         $proc = Start-Process -FilePath $Python `
-            -ArgumentList @('-u', $Main, 'watch', '--interval', $Interval) `
+            -ArgumentList @('-u', $Main, 'serve', '--interval', $Interval) `
             -WorkingDirectory $Root `
             -RedirectStandardOutput (Join-Path $ReportDir 'watch.stdout.log') `
             -RedirectStandardError  (Join-Path $ReportDir 'watch.stderr.log') `
@@ -95,7 +96,7 @@ try {
 
         # 退避：第 1 次 10s，第 2 次 30s，第 3 次起 60s
         $backoff = switch ($crashTimes.Count) { 1 { 10 } 2 { 30 } default { 60 } }
-        Write-Log "watch 进程退出（exit=$code），${backoff}s 后重启（近 1h 崩溃 $($crashTimes.Count) 次）" 'WARN'
+        Write-Log "serve 进程退出（exit=$code），${backoff}s 后重启（近 1h 崩溃 $($crashTimes.Count) 次）" 'WARN'
         Start-Sleep -Seconds $backoff
     }
 }
