@@ -1,0 +1,333 @@
+"""异动告警引擎：阈值规则 + 冷却去重 + Webhook 推送。"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import time
+from datetime import datetime
+from typing import Any
+
+import requests
+
+from . import analysis, config
+
+
+def _state_path():
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return config.STATE_DIR / "alerts.json"
+
+
+def _load_state() -> dict[str, float]:
+    path = _state_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(state: dict[str, float]) -> None:
+    try:
+        _state_path().write_text(json.dumps(state, ensure_ascii=False), "utf-8")
+    except OSError:
+        pass
+
+
+def evaluate(snapshot: analysis.MarketSnapshot) -> list[dict[str, Any]]:
+    """生成告警候选，并按冷却时间过滤。"""
+    th = config.THRESHOLDS
+    candidates: list[dict[str, Any]] = []
+
+    def add(key: str, level: str, message: str) -> None:
+        candidates.append({"key": key, "level": level, "message": message})
+
+    for item in snapshot.symbols:
+        symbol = item.symbol
+        if abs(item.change_24h_pct) >= th["move_24h_pct"]:
+            add(
+                f"{symbol}:move24h",
+                "warning",
+                f"{symbol} 24h {item.change_24h_pct:+.1f}%，当前 {item.regime}（{item.total_score:.0f}分）",
+            )
+
+        day = item.timeframes.get("1d")
+        if day and day.rsi is not None:
+            if day.rsi >= th["rsi_overbought"]:
+                add(f"{symbol}:rsi_overbought", "warning", f"{symbol} 日线 RSI {day.rsi:.1f}，超买")
+            elif day.rsi <= th["rsi_oversold"]:
+                add(f"{symbol}:rsi_oversold", "warning", f"{symbol} 日线 RSI {day.rsi:.1f}，超卖")
+
+        if day and day.resistance and day.support:
+            to_resistance = (day.resistance / item.price - 1) * 100
+            to_support = (item.price / day.support - 1) * 100
+            if 0 <= to_resistance <= th["level_alert_pct"]:
+                add(
+                    f"{symbol}:test_resistance",
+                    "info",
+                    f"{symbol} 正在测试日线阻力 {day.resistance:,.2f}，突破需放量确认",
+                )
+            elif 0 <= to_support <= th["level_alert_pct"]:
+                add(
+                    f"{symbol}:test_support",
+                    "info",
+                    f"{symbol} 正在测试日线支撑 {day.support:,.2f}，跌破则结构转弱",
+                )
+
+        deriv = item.derivatives
+        if deriv:
+            funding = deriv.get("funding_annualized_pct")
+            if funding is not None and funding > th["funding_crowded_long"]:
+                add(f"{symbol}:funding_hot", "warning", f"{symbol} 资金费率年化 {funding:.0f}%，多头拥挤")
+            elif funding is not None and funding < th["funding_crowded_short"]:
+                add(f"{symbol}:funding_short", "info", f"{symbol} 资金费率年化 {funding:.0f}%，空头拥挤")
+            oi_change = deriv.get("oi_change_1h_pct")
+            if oi_change is not None and abs(oi_change) >= th["oi_alert_pct"]:
+                direction = "增仓" if oi_change > 0 else "减仓"
+                add(f"{symbol}:oi_change", "warning", f"{symbol} 1h 持仓量{direction} {oi_change:+.1f}%")
+
+        hour = item.timeframes.get("1h")
+        if hour and hour.vol_ratio is not None and hour.vol_ratio >= th["vol_ratio_alert"]:
+            add(
+                f"{symbol}:volume_spike",
+                "info",
+                f"{symbol} 1h 成交量为 20 周期均量的 {hour.vol_ratio:.1f} 倍",
+            )
+
+    fng = snapshot.sentiment.get("value")
+    if fng is not None:
+        if fng >= th["fng_extreme_greed"]:
+            add("market:fng_greed", "warning", f"恐慌贪婪指数 {fng}，处于极度贪婪区间")
+        elif fng <= th["fng_extreme_fear"]:
+            add("market:fng_fear", "info", f"恐慌贪婪指数 {fng}，处于极度恐慌区间")
+
+    stable_change = snapshot.onchain.get("change_7d_pct")
+    if stable_change is not None and stable_change <= th["stable_outflow_7d_pct"]:
+        add(
+            "market:stablecoin_outflow",
+            "warning",
+            f"稳定币 7d 减少 {abs(stable_change):.2f}%，场内资金流出",
+        )
+
+    state = _load_state()
+    now = time.time()
+    fired = [c for c in candidates if now - state.get(c["key"], 0.0) >= config.ALERT_COOLDOWN]
+    for item in fired:
+        state[item["key"]] = now
+    _save_state(state)
+    return fired
+
+
+def _sign(timestamp: str, secret: str) -> str:
+    """飞书自定义机器人加签：HmacSHA256(timestamp + "\\n" + secret, 空内容) 后 Base64。"""
+    string_to_sign = f"{timestamp}\n{secret}"
+    digest = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _is_feishu(url: str) -> bool:
+    return "feishu" in url or "larksuite" in url
+
+
+def _send(payload: dict[str, Any]) -> bool:
+    """发送 Webhook 请求，自动处理加签与错误码。"""
+    if not config.WEBHOOK_URL:
+        print("[推送跳过] 未配置 WEBHOOK_URL")
+        return False
+    if config.WEBHOOK_SECRET:
+        timestamp = str(int(time.time()))
+        payload["timestamp"] = timestamp
+        payload["sign"] = _sign(timestamp, config.WEBHOOK_SECRET)
+
+    try:
+        resp = requests.post(config.WEBHOOK_URL, json=payload, timeout=10)
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        code = data.get("code", data.get("errcode", data.get("StatusCode")))
+        if resp.status_code >= 400 or (code is not None and code != 0):
+            reason = data.get("msg") or data.get("StatusMessage") or resp.text[:200]
+            print(f"[推送失败] HTTP {resp.status_code} code={code} {reason}")
+            return False
+        return True
+    except Exception as exc:
+        print(f"[推送失败] {exc}")
+        return False
+
+
+def push(message: str) -> bool:
+    """推送文本消息到 Webhook（飞书 content.text / 钉钉 text.content 自适应）。"""
+    if not config.WEBHOOK_URL:
+        return False
+    if "dingtalk" in config.WEBHOOK_URL:
+        payload: dict[str, Any] = {"msgtype": "text", "text": {"content": message}}
+    else:
+        payload = {"msg_type": "text", "content": {"text": message}}
+    return _send(payload)
+
+
+def push_card(card: dict[str, Any]) -> bool:
+    """推送飞书 interactive 卡片消息。"""
+    if not config.WEBHOOK_URL:
+        return False
+    if not _is_feishu(config.WEBHOOK_URL):
+        # 钉钉等非飞书机器人不支持 interactive 卡片，降级为文本
+        fallback = _card_to_text(card)
+        return push(fallback)
+    payload: dict[str, Any] = {"msg_type": "interactive", "card": card}
+    return _send(payload)
+
+
+def _card_to_text(card: dict[str, Any]) -> str:
+    """卡片降级为纯文本（用于非飞书机器人或调试）。"""
+    lines: list[str] = []
+    header = card.get("header") or {}
+    title = (header.get("title") or {}).get("content")
+    if title:
+        lines.append(f"== {title} ==")
+    for element in card.get("elements") or []:
+        text = (element.get("text") or {}).get("content")
+        if text:
+            lines.append(text)
+    return "\n\n".join(lines)
+
+
+def _md_div(content: str) -> dict[str, Any]:
+    return {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+
+
+def _hr() -> dict[str, Any]:
+    return {"tag": "hr"}
+
+
+def _note(content: str) -> dict[str, Any]:
+    return {"tag": "note", "elements": [{"tag": "lark_md", "content": content}]}
+
+
+def build_brief_card(
+    snapshot: analysis.MarketSnapshot,
+    commentary: str | None = None,
+    report_path: str | None = None,
+) -> dict[str, Any]:
+    """把行情简报压缩成飞书卡片（lark_md 不支持表格，改为逐行列举）。"""
+    from . import report as _report
+
+    elements: list[dict[str, Any]] = []
+
+    # 结论速览：每币种一行
+    overview_lines: list[str] = []
+    for item in snapshot.symbols:
+        line = (
+            f"**{item.symbol}** {_report._price(item.price)}"
+            f" ｜ 24h **{_report._pct(item.change_24h_pct)}**"
+            f" ｜ {item.total_score:.0f}分 {item.regime}"
+        )
+        one_liner = _report._one_liner(item)
+        if one_liner:
+            line += f"\n　{one_liner}"
+        overview_lines.append(line)
+    elements.append(_md_div("**一、结论速览**\n" + "\n".join(overview_lines)))
+
+    if commentary:
+        commentary_text = commentary.strip()
+        if len(commentary_text) > 600:
+            commentary_text = commentary_text[:600] + "…"
+        elements.append(_md_div(f"**分析师点评**\n{commentary_text}"))
+
+    # 市场温度计
+    thermo: list[str] = []
+    stable = snapshot.onchain
+    if stable:
+        thermo.append(
+            f"稳定币总供应 {_report._compact_usd(stable.get('total_usd'))}，7d {_report._pct(stable.get('change_7d_pct'))}"
+        )
+    fng = snapshot.sentiment
+    if fng:
+        thermo.append(
+            f"恐慌贪婪 {fng.get('value')}（{fng.get('label')}），1d {fng.get('change_1d')}"
+        )
+    dxy = snapshot.macro.get("dxy")
+    ndx = snapshot.macro.get("ndx")
+    if dxy:
+        thermo.append(f"美元指数 {dxy.get('last'):.2f}，5d {_report._pct(dxy.get('change_5d_pct'))}")
+    if ndx:
+        thermo.append(f"纳指100 {ndx.get('last'):,.0f}，5d {_report._pct(ndx.get('change_5d_pct'))}")
+    if thermo:
+        elements.append(_hr())
+        elements.append(_md_div("**二、市场温度计**\n" + "\n".join(thermo)))
+
+    # 币种关键价位与异动（只列有信号的）
+    signal_lines: list[str] = []
+    for item in snapshot.symbols:
+        levels = item.key_levels or {}
+        parts: list[str] = []
+        if levels.get("day_support") or levels.get("day_resistance"):
+            parts.append(
+                f"日线支撑 {_report._price(levels.get('day_support'))} / 阻力 {_report._price(levels.get('day_resistance'))}"
+            )
+        if item.flags:
+            parts.append("异动：" + "；".join(item.flags))
+        if parts:
+            signal_lines.append(f"**{item.symbol}**：" + "；".join(parts))
+    if signal_lines:
+        elements.append(_hr())
+        elements.append(_md_div("**三、关键价位与异动**\n" + "\n".join(signal_lines)))
+
+    # 数据缺口
+    if snapshot.warnings:
+        elements.append(_hr())
+        elements.append(_md_div("**数据缺口**\n" + "；".join(snapshot.warnings)))
+
+    # 底部附注
+    note_parts = ["本简报由程序化指标生成，不构成投资建议"]
+    if report_path:
+        note_parts.append(f"完整报告：{report_path}")
+    elements.append(_note(" ｜ ".join(note_parts)))
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": f"加密市场行情简报 · {snapshot.generated_at}"},
+        },
+        "elements": elements,
+    }
+
+
+def format_alerts(alerts: list[dict[str, Any]]) -> str:
+    if not alerts:
+        return "本轮无触发告警。"
+    stamp = datetime.now().strftime("%H:%M:%S")
+    lines = [f"[{stamp}] 触发 {len(alerts)} 条异动："]
+    for item in alerts:
+        mark = "!" if item["level"] == "warning" else "-"
+        lines.append(f"  {mark} {item['message']}")
+    return "\n".join(lines)
+
+
+def run_watch(interval: int | None = None, once: bool = False) -> None:
+    interval = interval or config.ALERT_INTERVAL
+    print(f"异动监控启动，轮询间隔 {interval}s，冷却 {config.ALERT_COOLDOWN}s（Ctrl+C 退出）")
+    while True:
+        try:
+            snapshot = analysis.build_snapshot(include_news=False)
+            alerts = evaluate(snapshot)
+            text = format_alerts(alerts)
+            print(text)
+            if alerts:
+                push(text)
+        except KeyboardInterrupt:
+            print("\n已停止监控。")
+            return
+        except Exception as exc:  # 单轮失败不影响后续轮询
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 本轮采集失败: {exc}")
+        if once:
+            return
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\n已停止监控。")
+            return
