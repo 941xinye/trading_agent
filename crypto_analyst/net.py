@@ -50,6 +50,46 @@ def _save_cache(key: str, data: Any) -> None:
         pass
 
 
+def prune_cache(max_age_days: float | None = None, max_files: int | None = None) -> int:
+    """清理过期与超量缓存文件，返回删除数量。
+
+    先按保留天数删除过期文件；若剩余文件数仍超过上限，再按修改时间从旧到新删除。
+    任何单个文件删除失败都跳过，不影响启动流程。
+    """
+    directory = config.CACHE_DIR
+    if not directory.exists():
+        return 0
+
+    age_days = config.CACHE_MAX_AGE_DAYS if max_age_days is None else max_age_days
+    limit = config.CACHE_MAX_FILES if max_files is None else max_files
+    cutoff = time.time() - max(age_days, 0.0) * 86400
+    removed = 0
+    entries: list[tuple[float, Path]] = []
+    for path in directory.glob("*.json"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if age_days > 0 and mtime < cutoff:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+            continue
+        entries.append((mtime, path))
+
+    if limit > 0 and len(entries) > limit:
+        entries.sort(key=lambda item: item[0])
+        for _mtime, path in entries[: len(entries) - limit]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def _request(
     url: str, params: dict | None, retries: int, timeout: float | None = None
 ) -> requests.Response:

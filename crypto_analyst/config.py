@@ -76,6 +76,9 @@ HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", str(BASE_DIR / ".cache")))
 STATE_DIR = Path(os.getenv("STATE_DIR", str(BASE_DIR / ".state")))
 REPORT_DIR = Path(os.getenv("REPORT_DIR", str(BASE_DIR / "reports")))
+# 缓存淘汰：超过保留天数的缓存文件清理；文件数超上限时按最旧优先删除
+CACHE_MAX_AGE_DAYS = float(os.getenv("CACHE_MAX_AGE_DAYS", "7"))
+CACHE_MAX_FILES = int(os.getenv("CACHE_MAX_FILES", "3000"))
 
 # LLM（任意 OpenAI 兼容接口：DeepSeek / Kimi / 通义 / 本地 vLLM 等）
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
@@ -87,9 +90,24 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 ALERT_INTERVAL = int(os.getenv("ALERT_INTERVAL", "300"))
 ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "1800"))
+# 告警冷却状态保留时长（小时）：过期记录自动清理，避免 alerts.json 无限膨胀
+ALERT_STATE_TTL_HOURS = float(os.getenv("ALERT_STATE_TTL_HOURS", "168"))
 # 夜间静默时段（本地时区，支持跨零点如 23:00-07:00，留空不启用）：期间告警只落盘不推送
 ALERT_QUIET_HOURS = os.getenv("ALERT_QUIET_HOURS", "").strip()
 # 最低推送级别：info 全部推送；warning 只推 warning，info 仍会落盘
 ALERT_MIN_LEVEL = os.getenv("ALERT_MIN_LEVEL", "info").strip().lower()
 # 内置调度（main.py serve）的每日简报推送时间，24 小时制、逗号分隔
 BRIEF_PUSH_TIMES = os.getenv("BRIEF_PUSH_TIMES", "09:00,21:00").strip()
+
+# 本地 HTTP API（main.py api）：默认仅监听本机，对外暴露时务必配置 API_TOKEN
+API_HOST = os.getenv("API_HOST", "127.0.0.1").strip()
+API_PORT = int(os.getenv("API_PORT", "8080"))
+API_TOKEN = os.getenv("API_TOKEN", "").strip()
+
+# 飞书双向机器人（自建应用 + 事件订阅）：接收群内 @机器人 的消息并回复
+FEISHU_BASE_URL = os.getenv("FEISHU_BASE_URL", "https://open.feishu.cn").rstrip("/")
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "").strip()
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "").strip()
+FEISHU_VERIFY_TOKEN = os.getenv("FEISHU_VERIFY_TOKEN", "").strip()
+FEISHU_BOT_HOST = os.getenv("FEISHU_BOT_HOST", "127.0.0.1").strip()
+FEISHU_BOT_PORT = int(os.getenv("FEISHU_BOT_PORT", "8787"))

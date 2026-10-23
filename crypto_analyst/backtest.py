@@ -28,6 +28,10 @@ MIN_SLACK_S = 600.0
 QUANTILE_BUCKETS = 5
 # 权重敏感性扫描的单次调整幅度
 WEIGHT_STEP = 0.05
+# 权重建议：单维度最低权重（避免 IC 为负的维度被直接归零）
+MIN_DIM_WEIGHT = 0.05
+# 权重建议所需的最少有效窗口数，与回测结论口径保持一致
+MIN_RECOMMEND_SAMPLES = 30
 
 
 def _pearson(xs: list[float], ys: list[float]) -> float | None:
@@ -111,6 +115,7 @@ def evaluate_pairs(
                     "symbol": symbol,
                     "ts": cur.get("ts"),
                     "score": float(cur["total_score"]),
+                    "dim_scores": cur.get("scores") or {},
                     "forward_pct": (nxt["price"] / cur["price"] - 1.0) * 100.0,
                     "lag_hours": lag_s / 3600.0,
                     "mae_pct": (low / cur["price"] - 1.0) * 100.0,
@@ -352,10 +357,129 @@ def weight_sensitivity(
     return lines
 
 
+def _round_weights(weights: dict[str, float]) -> dict[str, float]:
+    """保留两位小数，并把四舍五入误差补到最大项，保证总和为 1。"""
+    rounded = {dim: round(value, 2) for dim, value in weights.items()}
+    residual = round(1.0 - sum(rounded.values()), 2)
+    if residual:
+        biggest = max(rounded, key=lambda dim: rounded[dim])
+        rounded[biggest] = round(rounded[biggest] + residual, 2)
+    return rounded
+
+
+def recommend_weights(
+    records: list[dict[str, Any]],
+    horizon_hours: float = 24.0,
+) -> dict[str, Any]:
+    """按各维度 IC 给出推荐权重。
+
+    与回测使用同一批非重叠窗口样本，分别计算「各维度分数 vs 未来收益」的 Spearman IC：
+    IC 为正的维度按比例分配权重，非正维度保留最低权重，避免把某个维度直接归零。
+    样本不足或所有维度 IC 均非正时不给出建议，只回传当前 IC 供观察。
+    """
+    usable = [
+        rec
+        for rec in records
+        if rec.get("scores") and all(dim in rec["scores"] for dim in config.DIMENSION_WEIGHTS)
+    ]
+    pairs = evaluate_pairs(usable, horizon_hours)
+    forwards = [p["forward_pct"] for p in pairs]
+    ics: dict[str, float | None] = {}
+    if pairs:
+        for dimension in config.DIMENSION_WEIGHTS:
+            values = [float(p["dim_scores"][dimension]) for p in pairs]
+            ics[dimension] = _spearman(values, forwards)
+
+    def _rows(suggested: dict[str, float] | None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for dimension, current in config.DIMENSION_WEIGHTS.items():
+            target = suggested.get(dimension) if suggested else None
+            rows.append(
+                {
+                    "dimension": dimension,
+                    "current": current,
+                    "ic": ics.get(dimension),
+                    "suggested": target,
+                    "delta": (target - current) if target is not None else None,
+                }
+            )
+        return rows
+
+    if len(pairs) < MIN_RECOMMEND_SAMPLES:
+        return {
+            "samples": len(pairs),
+            "ready": False,
+            "rows": _rows(None),
+            "suggested": {},
+            "note": (
+                f"有效窗口 {len(pairs)} 个，不足 {MIN_RECOMMEND_SAMPLES} 个，"
+                "暂不给出权重建议；继续挂 watch 积累样本。"
+            ),
+        }
+
+    if not any(ic is not None and ic > 0 for ic in ics.values()):
+        return {
+            "samples": len(pairs),
+            "ready": False,
+            "rows": _rows(None),
+            "suggested": {},
+            "note": "各维度 IC 均非正，当前样本无法给出可信权重，建议先检查评分规则方向。",
+        }
+
+    raw = {
+        dimension: max(ic if ic is not None else 0.0, MIN_DIM_WEIGHT)
+        for dimension, ic in ics.items()
+    }
+    total = sum(raw.values())
+    suggested = _round_weights({dimension: value / total for dimension, value in raw.items()})
+    return {
+        "samples": len(pairs),
+        "ready": True,
+        "rows": _rows(suggested),
+        "suggested": suggested,
+        "note": (
+            "建议权重按各维度 IC 占比分配，非正维度保留 5% 下限；"
+            "建议先小步调整（每次 5-10pp）并继续积累样本复测。"
+        ),
+    }
+
+
+def _recommend_section(records: list[dict[str, Any]], horizon_hours: float) -> list[str]:
+    result = recommend_weights(records, horizon_hours)
+    lines: list[str] = [f"### 权重建议 · 未来 {horizon_hours:g}h", ""]
+    lines.append(f"有效窗口 {result['samples']} 个（与回测同口径的非重叠样本）")
+    lines.append("")
+    lines.append("| 维度 | 当前权重 | 维度 IC | 建议权重 | Δ |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for row in result["rows"]:
+        ic_text = f"{row['ic']:+.2f}" if row["ic"] is not None else "—"
+        suggested_text = f"{row['suggested']:.0%}" if row["suggested"] is not None else "—"
+        delta_text = f"{row['delta']:+.0%}" if row["delta"] is not None else "—"
+        lines.append(
+            f"| {row['dimension']} | {row['current']:.0%} | {ic_text} | {suggested_text} | {delta_text} |"
+        )
+    lines.append("")
+    lines.append(result["note"])
+    if result["ready"]:
+        body = ", ".join(
+            f'"{dimension}": {result["suggested"][dimension]:.2f}'
+            for dimension in config.DIMENSION_WEIGHTS
+        )
+        lines.append("")
+        lines.append("可直接替换 `config.py` 中的 `DIMENSION_WEIGHTS`：")
+        lines.append("")
+        lines.append("```python")
+        lines.append(f"DIMENSION_WEIGHTS = {{{body}}}")
+        lines.append("```")
+    lines.append("")
+    return lines
+
+
 def run(
     horizon_hours: float | Iterable[float] = 24.0,
     source: str = "watch",
     sweep_weights: bool = False,
+    recommend: bool = False,
 ) -> str:
     horizons = _normalize_horizons(horizon_hours)
     all_records = list(history.iter_records())
@@ -397,4 +521,8 @@ def run(
         lines.append("")
         for horizon in horizons:
             lines.extend(weight_sensitivity(records, horizon))
+    if recommend:
+        lines.append("")
+        for horizon in horizons:
+            lines.extend(_recommend_section(records, horizon))
     return "\n".join(lines)

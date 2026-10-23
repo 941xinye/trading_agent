@@ -22,12 +22,14 @@
 | 情绪面 | 恐慌贪婪指数（当前值、1d/7d 变化、30日均值）+ 加密快讯 | alternative.me、Cointelegraph/Decrypt RSS |
 | 宏观联动 | 美元指数、纳斯达克100、标普500 的点位与 1d/5d 涨跌 | 东方财富公开行情 |
 
-四类交互方式 + 一条推送通道全部实现：
+交互与推送通道全部实现：
 
 - **定时简报** `brief`：生成 Markdown 简报并落盘，结论速览自动带「较上次 / 较昨日」评分与状态变化；
 - **对话问答** `ask`：LLM 自主调用 7 个数据工具后作答；`ask -i` 进入多轮对话，上下文保留最近 3 轮；
 - **仪表盘** `dashboard`：把落盘快照渲染成静态 HTML（评分走势 + 五维拆解），本地直接打开；
 - **异动告警** `watch`：阈值触发 + 冷却去重 + Webhook 推送，覆盖 24h 异动 / RSI 超买卖 / 支撑阻力测试与突破 / 资金费率拥挤与极端分位 / 持仓量异动 / 量能放大 / 评分状态切换 / 恐慌贪婪极端值 / 稳定币流出；
+- **本地 API** `api`：`/health`、`/snapshot`、`/dashboard`、`/brief`、`/ask` 五个接口，供本地页面或脚本调用；
+- **飞书双向** `feishu-hook`：自建应用订阅消息事件，群内 @机器人 直接提问并回复；
 - **飞书推送** `push-test` / `brief --push`：支持飞书自定义机器人 text 与 interactive 卡片消息，可选 HmacSHA256 加签。
 
 ## 三、系统架构
@@ -69,6 +71,10 @@ macro.py     ─┘                                   ├─> alerts.py  ──>
 │  ├─ prompts.py            # 人格与分析规范
 │  ├─ report.py             # Markdown 简报
 │  ├─ alerts.py             # 告警引擎 + 飞书推送
+│  ├─ briefing.py           # 简报链路（CLI / 调度共用）
+│  ├─ scheduler.py          # 内置调度（watch + 每日简报）
+│  ├─ api.py                # 本地 HTTP API
+│  ├─ feishu_bot.py         # 飞书双向机器人（事件回调）
 │  ├─ llm.py                # OpenAI 兼容客户端
 │  ├─ cli.py                # 命令行子命令
 │  └─ providers/            # 四类数据源
@@ -151,11 +157,20 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 .venv\Scripts\python.exe main.py backtest                    # 默认 24h 窗口、只统计 watch 来源
 .venv\Scripts\python.exe main.py backtest --hours 4,24,72    # 多窗口对比
 .venv\Scripts\python.exe main.py backtest --sweep            # 附加权重敏感性扫描
+.venv\Scripts\python.exe main.py backtest --recommend        # 按各维度 IC 给出推荐权重（需 ≥30 个窗口）
 .venv\Scripts\python.exe main.py backtest --source all       # 全量来源（含 brief / ask / 调试快照）
 
 # 7) 静态 HTML 仪表盘（生成后直接双击打开，无需服务器）
 .venv\Scripts\python.exe main.py dashboard                   # 默认回看 7 天，输出 reports/dashboard.html
 .venv\Scripts\python.exe main.py dashboard --days 3 --source watch
+
+# 8) 本地 HTTP API（默认仅监听 127.0.0.1:8080）
+.venv\Scripts\python.exe main.py api
+#    GET  /health | /snapshot | /dashboard | /brief
+#    POST /ask   {"question": "BTC 能追多吗", "symbols": ["BTC"]}
+
+# 9) 飞书双向机器人（自建应用 + 事件订阅，回调地址 /feishu/event）
+.venv\Scripts\python.exe main.py feishu-hook --port 8787
 ```
 
 每次 `brief` / `watch` / `snapshot` / `ask` 运行后，评分快照会自动追加到 `.state/snapshots/YYYYMMDD.jsonl`（每个标的一行，并带 `source` 标记区分来源）。
@@ -167,7 +182,8 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 1. **状态桶**：按 `REGIME_THRESHOLDS` 分桶，看"偏多/偏空"是否对应正/负收益；
 2. **分位桶**：按综合分排序五等分（Q1 最低 → Q5 最高），样本不足时也不会出现空桶，用于检查收益单调性；
 3. **收益质量**：Pearson r、Spearman IC（秩相关，抗极端值）、整体胜率、均盈/均亏、盈亏比、平均最大不利偏移（MAE，窗口内最低价相对入场价）；
-4. **权重敏感性**（`--sweep`）：各维度权重 ±5pp、其余维度等比缩放后重算总分，观察相关系数变化；某方向能明显提升 r，说明该维度权重偏低。
+4. **权重敏感性**（`--sweep`）：各维度权重 ±5pp、其余维度等比缩放后重算总分，观察相关系数变化；某方向能明显提升 r，说明该维度权重偏低；
+5. **权重建议**（`--recommend`）：用同一批非重叠样本分别计算每个维度分数与未来收益的 Spearman IC，按正 IC 占比给出建议权重（非正维度保留 5% 下限），并输出可直接替换的 `DIMENSION_WEIGHTS` 代码块。有效窗口不足 30 个时只展示 IC，不给出建议。
 
 ## 七、配置项（.env）
 
@@ -182,6 +198,8 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 | `KLINE_LIMIT` | `300` | 每次拉取的 K 线根数，越大指标越稳、请求越重 |
 | `HTTP_TIMEOUT` | `12` | 单次 HTTP 请求超时（秒） |
 | `CACHE_DIR` | `.cache` | HTTP 磁盘缓存目录 |
+| `CACHE_MAX_AGE_DAYS` | `7` | 缓存文件保留天数，超过自动清理 |
+| `CACHE_MAX_FILES` | `3000` | 缓存文件数上限，超出按最旧优先删除 |
 | `STATE_DIR` | `.state` | 告警冷却状态、评分快照目录 |
 | `REPORT_DIR` | `reports` | 简报、告警日志输出目录 |
 | `LLM_BASE_URL` | `https://api.deepseek.com` | 任意 OpenAI 兼容接口 |
@@ -189,11 +207,21 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 | `LLM_MODEL` | `deepseek-chat` | 模型名 |
 | `ALERT_INTERVAL` | 300 | 轮询间隔（秒） |
 | `ALERT_COOLDOWN` | 1800 | 同类告警冷却（秒），按 `交易所:标的:类型` 独立计时 |
+| `ALERT_STATE_TTL_HOURS` | 168 | 冷却记录保留时长（小时），过期自动清理 |
 | `ALERT_QUIET_HOURS` | 空 | 夜间静默时段，如 `23:00-07:00`（支持跨零点）；期间告警只写 `alerts.log` 不推送 |
 | `ALERT_MIN_LEVEL` | `info` | 最低推送级别：`info` 全推；`warning` 只推 warning，info 仍落盘 |
 | `BRIEF_PUSH_TIMES` | `09:00,21:00` | `serve` 每日简报推送时间点，24 小时制、逗号分隔 |
 | `WEBHOOK_URL` | 空 | 飞书/钉钉自定义机器人 Webhook，留空不推送；含 `feishu` 或 `larksuite` 判定为飞书 |
 | `WEBHOOK_SECRET` | 空 | 飞书机器人开启「签名校验」时填入 secret，未开启留空 |
+| `API_HOST` | `127.0.0.1` | 本地 API 监听地址；对外暴露时改成 `0.0.0.0` 并配置 token |
+| `API_PORT` | `8080` | 本地 API 端口 |
+| `API_TOKEN` | 空 | 为空不鉴权；配置后请求需带 `X-API-Token` 或 `Authorization: Bearer <token>` |
+| `FEISHU_BASE_URL` | `https://open.feishu.cn` | 飞书开放平台地址，Lark 国际版可改 |
+| `FEISHU_APP_ID` | 空 | 自建应用 App ID（双向机器人用，不是 Webhook） |
+| `FEISHU_APP_SECRET` | 空 | 自建应用 App Secret |
+| `FEISHU_VERIFY_TOKEN` | 空 | 事件订阅的 Verification Token，用于校验回调来源 |
+| `FEISHU_BOT_HOST` | `127.0.0.1` | 事件回调监听地址 |
+| `FEISHU_BOT_PORT` | `8787` | 事件回调端口 |
 
 ### 交易所切换
 
@@ -224,6 +252,44 @@ Binance 说明：
    - `watch` 监控触发阈值时自动推送文本告警，享受冷却去重；告警同时追加到 `reports/alerts.log`，推送失败也能回溯；
    - 非飞书机器人（如钉钉）自动降级为纯文本。
 
+### 本地 API
+
+`api` 用标准库起的服务，默认 `127.0.0.1:8080`，不依赖额外包：
+
+| 接口 | 方法 | 说明 |
+| --- | --- | --- |
+| `/health` | GET | 健康检查，返回当前交易所与标的 |
+| `/snapshot` | GET | 结构化快照 JSON；`symbols=BTC,ETH`、`news=1` 可选 |
+| `/dashboard` | GET | 动态渲染仪表盘 HTML；`days=7`、`source=watch` 可选 |
+| `/brief` | GET/POST | 生成简报并返回 Markdown；`llm=0` 关闭点评 |
+| `/ask` | POST | `{"question":"...","symbols":["BTC"]}`，返回 Agent 回答 |
+
+```powershell
+curl.exe "http://127.0.0.1:8080/health"
+curl.exe "http://127.0.0.1:8080/snapshot?symbols=BTC"
+curl.exe -X POST "http://127.0.0.1:8080/ask" -H "Content-Type: application/json" -d '{"question":"BTC 现在能追多吗"}'
+```
+
+> 默认只监听本机。需要从其他设备访问时用 `--host 0.0.0.0` 并在 `.env` 配置 `API_TOKEN`（请求带 `X-API-Token` 或 `Authorization: Bearer <token>`）。
+
+### 飞书双向机器人
+
+与「自定义机器人 Webhook」不同，双向问答需要**自建应用 + 事件订阅**：
+
+1. 飞书开放平台创建企业自建应用，开启「机器人」能力；
+2. 申请权限：接收消息（`im:message`）、以应用身份发消息（`im:message:send_as_bot`）；
+3. 事件订阅添加 `im.message.receive_v1`（接收消息），请求地址填 `https://你的域名/feishu/event`；本机可用内网穿透映射到 `8787`；
+4. 把 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_VERIFY_TOKEN` 填入 `.env`，启动 `main.py feishu-hook --port 8787`；
+5. 群里 @机器人 提问即可收到回答，单聊直接发消息也会回复；同一事件重推会自动去重。
+
+> 回调需要公网可达；LLM 回答通常超过飞书 3 秒超时，服务会先返回受理、再后台回答并回帖。暂不支持加密回调，请在后台关闭 Encrypt Key。
+
+### 维护与清理
+
+- 每次 CLI 启动自动清理 `.cache`：超过 `CACHE_MAX_AGE_DAYS` 的文件删除，超过 `CACHE_MAX_FILES` 时按最旧优先删除；
+- 告警冷却记录超过 `ALERT_STATE_TTL_HOURS` 自动从 `.state/alerts.json` 移除，避免长期运行无限膨胀；
+- 两个清理都跳过失败项，不影响主流程。
+
 ### 定时推送（内置调度 `serve`）
 
 定时简报由常驻进程 `serve` 负责，不再依赖 Windows 计划任务：
@@ -243,7 +309,7 @@ Binance 说明：
 
 日常推荐用 `scripts\watch_start.ps1` 在后台拉起守护进程，daemon 内部执行的就是 `main.py serve`，因此告警与定时简报共用同一份进程状态，不会重复采集。
 
-### watch 常驻（攒回测样本）
+### 后台守护（长期采集，攒回测样本）
 
 `serve`（内含 watch 轮询）需要长时间挂起才能攒够回测样本（≥30 个有效窗口，约 10 天 × 3 标的）。仓库提供 4 个脚本：
 

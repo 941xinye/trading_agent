@@ -5,7 +5,7 @@ import argparse
 import json
 import sys
 
-from . import analysis, alerts, backtest, briefing, config
+from . import analysis, alerts, backtest, briefing, config, net
 from .agent import MarketAnalyst
 from .llm import LLMError
 from .providers.exchanges import EXCHANGE_NAMES
@@ -82,6 +82,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="附加权重敏感性扫描（各维度 ±5pp 对相关系数的影响）",
     )
     p_backtest.add_argument(
+        "--recommend",
+        action="store_true",
+        help="按各维度 IC 给出推荐权重（样本不足 30 个窗口时只展示 IC）",
+    )
+    p_backtest.add_argument(
         "--source",
         choices=["watch", "brief", "snapshot", "ask", "all"],
         default="watch",
@@ -97,6 +102,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="只统计该来源的快照，默认 all",
     )
     p_dash.add_argument("--out", help="输出路径，默认 reports/dashboard.html")
+
+    p_api = sub.add_parser("api", help="启动本地 HTTP API（快照 / 简报 / 问答 / 仪表盘）")
+    p_api.add_argument("--host", help="监听地址，默认 127.0.0.1（对外暴露前请配置 API_TOKEN）")
+    p_api.add_argument("--port", type=int, help="监听端口，默认 8080")
+
+    p_feishu = sub.add_parser("feishu-hook", help="飞书事件回调：群内 @机器人 直接问答（需自建应用）")
+    p_feishu.add_argument("--host", help="监听地址，默认 127.0.0.1")
+    p_feishu.add_argument("--port", type=int, help="监听端口，默认 8787")
 
     return parser
 
@@ -186,6 +199,20 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_api(args: argparse.Namespace) -> int:
+    from . import api
+
+    api.serve(host=args.host, port=args.port)
+    return 0
+
+
+def _cmd_feishu_hook(args: argparse.Namespace) -> int:
+    from . import feishu_bot
+
+    feishu_bot.serve(host=args.host, port=args.port)
+    return 0
+
+
 def _cmd_backtest(args: argparse.Namespace) -> int:
     horizons = [float(part) for part in str(args.hours).split(",") if part.strip()]
     print(
@@ -193,6 +220,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             horizon_hours=horizons or 24.0,
             source=args.source,
             sweep_weights=args.sweep,
+            recommend=args.recommend,
         )
     )
     return 0
@@ -267,6 +295,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
+    removed = net.prune_cache()
+    if removed:
+        print(f"[缓存] 已清理 {removed} 个过期缓存文件", file=sys.stderr)
+
     if getattr(args, "exchange", None):
         config.EXCHANGE = args.exchange
     if config.EXCHANGE not in EXCHANGE_NAMES:
@@ -281,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
         "ask": _cmd_ask,
         "watch": _cmd_watch,
         "serve": _cmd_serve,
+        "api": _cmd_api,
+        "feishu-hook": _cmd_feishu_hook,
         "snapshot": _cmd_snapshot,
         "push-test": _cmd_push_test,
         "backtest": _cmd_backtest,

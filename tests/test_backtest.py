@@ -177,3 +177,57 @@ def test_run_filters_by_source(monkeypatch):
     text = backtest.run(horizon_hours=24, source="watch")
     assert "已忽略 1 条" in text
     assert "样本 1 个窗口" in text
+
+
+def _scored_records(count: int) -> list[dict]:
+    """构造 count 个非重叠窗口：技术面与收益同向，情绪与收益反向。"""
+    records = []
+    price = 100.0
+    for i in range(count + 1):
+        records.append(
+            {
+                "symbol": "BTC",
+                "epoch": i * 86400.0,
+                "price": price,
+                "total_score": 50.0,
+                "scores": {
+                    "technical": 40.0 + i,
+                    "positioning": 50.0,
+                    "liquidity": 50.0,
+                    "sentiment": 60.0 - i,
+                    "macro": 50.0,
+                },
+                "ts": "",
+            }
+        )
+        # 未来收益随 i 递增，确保技术面分数与收益同向
+        price *= 1.0 + 0.01 * i
+    return records
+
+
+def test_recommend_weights_uses_dimension_ic():
+    result = backtest.recommend_weights(_scored_records(32), horizon_hours=24)
+    assert result["ready"] is True
+    assert result["samples"] == 32
+    rows = {row["dimension"]: row for row in result["rows"]}
+    assert rows["technical"]["ic"] == pytest.approx(1.0)
+    assert rows["sentiment"]["ic"] == pytest.approx(-1.0)
+    assert rows["technical"]["suggested"] > rows["technical"]["current"]
+    assert rows["sentiment"]["suggested"] < rows["sentiment"]["current"]
+    assert sum(result["suggested"].values()) == pytest.approx(1.0)
+
+
+def test_recommend_weights_requires_enough_samples():
+    result = backtest.recommend_weights(_scored_records(3), horizon_hours=24)
+    assert result["ready"] is False
+    assert "不足" in result["note"]
+    assert all(row["suggested"] is None for row in result["rows"])
+
+
+def test_recommend_section_renders_copyable_config(monkeypatch):
+    monkeypatch.setattr(backtest.history, "iter_records", lambda: iter(_scored_records(32)))
+    text = backtest.run(horizon_hours=24, source="all", recommend=True)
+    assert "### 权重建议 · 未来 24h" in text
+    assert "DIMENSION_WEIGHTS = {" in text
+    assert "| technical |" in text
+

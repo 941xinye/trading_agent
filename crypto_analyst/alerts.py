@@ -37,6 +37,15 @@ def _save_state(state: dict[str, float]) -> None:
         pass
 
 
+def _prune_state(state: dict[str, float], now: float, ttl_hours: float | None = None) -> dict[str, float]:
+    """丢弃超过保留时长的冷却记录，防止 alerts.json 无限增长。"""
+    ttl = config.ALERT_STATE_TTL_HOURS if ttl_hours is None else ttl_hours
+    if ttl <= 0:
+        return dict(state)
+    cutoff = now - ttl * 3600
+    return {key: ts for key, ts in state.items() if ts >= cutoff}
+
+
 def _previous_regimes(source: str = "watch") -> dict[str, str]:
     """从历史快照中读取每个标的"上一次"的 regime（即倒数第二条记录）。
 
@@ -172,6 +181,7 @@ def evaluate(snapshot: analysis.MarketSnapshot) -> list[dict[str, Any]]:
     # 冷却 key 带交易所前缀：切换 EXCHANGE 后不会误继承另一家交易所的冷却时间
     state = _load_state()
     now = time.time()
+    state = _prune_state(state, now)
 
     def state_key(key: str) -> str:
         return f"{config.EXCHANGE}:{key}"
