@@ -52,8 +52,13 @@ if (Test-Path $PidFile) {
     $oldPid = [int](Get-Content $PidFile -Raw).Trim()
     $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
     if ($oldProc) {
-        Write-Log "已有 watch 守护进程在运行（PID $oldPid），本次启动退出。" 'WARN'
-        exit 0
+        # PID 可能被系统复用，需确认命令行确实是本守护脚本，避免误判后永不启动
+        $oldCmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$oldPid" -ErrorAction SilentlyContinue).CommandLine
+        if ($oldCmd -and $oldCmd -like '*watch_daemon.ps1*') {
+            Write-Log "已有 watch 守护进程在运行（PID $oldPid），本次启动退出。" 'WARN'
+            exit 0
+        }
+        Write-Log "PID 文件中的 $oldPid 已被其他进程占用（非本守护脚本），忽略并重新启动。" 'WARN'
     }
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
 }

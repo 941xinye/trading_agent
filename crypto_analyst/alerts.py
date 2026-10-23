@@ -169,11 +169,18 @@ def evaluate(snapshot: analysis.MarketSnapshot) -> list[dict[str, Any]]:
             f"稳定币 7d 减少 {abs(stable_change):.2f}%，场内资金流出",
         )
 
+    # 冷却 key 带交易所前缀：切换 EXCHANGE 后不会误继承另一家交易所的冷却时间
     state = _load_state()
     now = time.time()
-    fired = [c for c in candidates if now - state.get(c["key"], 0.0) >= config.ALERT_COOLDOWN]
+
+    def state_key(key: str) -> str:
+        return f"{config.EXCHANGE}:{key}"
+
+    fired = [
+        c for c in candidates if now - state.get(state_key(c["key"]), 0.0) >= config.ALERT_COOLDOWN
+    ]
     for item in fired:
-        state[item["key"]] = now
+        state[state_key(item["key"])] = now
     _save_state(state)
     return fired
 
@@ -253,6 +260,20 @@ def _card_to_text(card: dict[str, Any]) -> str:
     return "\n\n".join(lines)
 
 
+def _truncate(text: str, limit: int) -> str:
+    """按句末标点截断，避免把点评拦腰切断。"""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for sep in ("。", "！", "？", "；", "\n"):
+        index = cut.rfind(sep)
+        if index >= int(limit * 0.6):
+            if sep == "\n":
+                return cut[:index].rstrip()
+            return cut[: index + 1].rstrip() + "…"
+    return cut.rstrip() + "…"
+
+
 def _md_div(content: str) -> dict[str, Any]:
     return {"tag": "div", "text": {"tag": "lark_md", "content": content}}
 
@@ -290,10 +311,7 @@ def build_brief_card(
     elements.append(_md_div("**一、结论速览**\n" + "\n".join(overview_lines)))
 
     if commentary:
-        commentary_text = commentary.strip()
-        if len(commentary_text) > 600:
-            commentary_text = commentary_text[:600] + "…"
-        elements.append(_md_div(f"**分析师点评**\n{commentary_text}"))
+        elements.append(_md_div(f"**分析师点评**\n{_truncate(commentary.strip(), 600)}"))
 
     # 市场温度计
     thermo: list[str] = []

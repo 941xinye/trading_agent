@@ -72,7 +72,7 @@ macro.py     ─┘                                   ├─> alerts.py  ──>
 │  └─ providers/            # 四类数据源
 │     └─ exchanges/         # 交易所适配：gate.py / binance.py，按 EXCHANGE 切换
 ├─ scripts/                 # watch 守护进程 / 简报计划任务批处理
-├─ tests/                   # pytest 单测（indicators / backtest）
+├─ tests/                   # pytest 单测（indicators / backtest / 评分 / 告警 / 简报）
 └─ reports/                 # 简报、告警与运行日志（自动创建）
 ```
 
@@ -142,13 +142,21 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 
 # 6) 评分回测（离线，用历史落盘快照检验"综合分 vs 未来收益"）
 .venv\Scripts\python.exe main.py backtest                    # 默认 24h 窗口、只统计 watch 来源
-.venv\Scripts\python.exe main.py backtest --hours 4          # 换 4h 窗口
+.venv\Scripts\python.exe main.py backtest --hours 4,24,72    # 多窗口对比
+.venv\Scripts\python.exe main.py backtest --sweep            # 附加权重敏感性扫描
 .venv\Scripts\python.exe main.py backtest --source all       # 全量来源（含 brief / ask / 调试快照）
 ```
 
 每次 `brief` / `watch` / `snapshot` / `ask` 运行后，评分快照会自动追加到 `.state/snapshots/YYYYMMDD.jsonl`（每个标的一行，并带 `source` 标记区分来源）。
 
-回测采用**非重叠窗口采样**：每个 `horizon` 窗口只取该窗口起点的一条记录作为样本，未来价格必须落在目标时刻 ±0.5×horizon 内，数据断档的窗口直接丢弃。因此样本量口径是"有效窗口数"而非"记录配对数"——挂 `watch` 时每标的每 24h 最多 1 个样本，攒够 30 个窗口（约 10 天 × 3 标的）再解读 Pearson 相关系数才有意义。
+回测采用**非重叠窗口采样**：每个 `horizon` 窗口只取该窗口起点的一条记录作为样本，未来价格必须落在目标时刻 ±0.5×horizon 内，数据断档的窗口直接丢弃。因此样本量口径是"有效窗口数"而非"记录配对数"——挂 `watch` 时每标的每 24h 最多 1 个样本，攒够 30 个窗口（约 10 天 × 3 标的）再解读相关系数才有意义。
+
+输出包含四块：
+
+1. **状态桶**：按 `REGIME_THRESHOLDS` 分桶，看"偏多/偏空"是否对应正/负收益；
+2. **分位桶**：按综合分排序五等分（Q1 最低 → Q5 最高），样本不足时也不会出现空桶，用于检查收益单调性；
+3. **收益质量**：Pearson r、Spearman IC（秩相关，抗极端值）、整体胜率、均盈/均亏、盈亏比、平均最大不利偏移（MAE，窗口内最低价相对入场价）；
+4. **权重敏感性**（`--sweep`）：各维度权重 ±5pp、其余维度等比缩放后重算总分，观察相关系数变化；某方向能明显提升 r，说明该维度权重偏低。
 
 ## 七、配置项（.env）
 
@@ -270,6 +278,7 @@ powershell -File scripts\watch_stop.ps1
 - 新闻为英文 RSS（国内中文快讯接口多数需要签名鉴权），标题可直接交给 LLM 翻译与筛选；
 - 资金费率分位基于当前所选交易所（Gate / Binance）永续近 90 天结算数据，不含其他交易所；
 - 回测基于落盘快照做"评分 vs 未来收益"的分桶统计与相关性检验，采用非重叠窗口采样（每窗口一个样本、允许 0.5×horizon 的价格滞后、断档窗口丢弃）。它只能回答"评分当时是否有预测力"，不能替代逐根 K 线的策略回测；后者可在 `backtest.py` 之上扩展。
+- 分位桶在样本 <5 个窗口时不输出，`--sweep` 在带分维度分数的快照 <3 条或无法算出基线 r 时直接跳过——样本越多，权重扫描的结论才越可信。
 - 回测只统计 `source=watch` 的记录（可用 `--source all` 放开），因此样本积累速度受 watch 运行时长限制：3 个标的每天最多 3 个 24h 窗口。
 
 ## 免责声明

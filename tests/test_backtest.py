@@ -102,6 +102,70 @@ def test_evaluate_pairs_resumes_after_gap():
     assert pairs[0]["forward_pct"] == pytest.approx(10.0)
 
 
+def test_spearman_catches_monotonic_nonlinear():
+    xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+    ys = [1.0, 4.0, 9.0, 16.0, 25.0]
+    assert backtest._spearman(xs, ys) == pytest.approx(1.0)
+    assert backtest._pearson(xs, ys) < 1.0
+
+
+def test_evaluate_pairs_records_max_adverse_excursion():
+    # 窗口内最低 95（-5%），期末 110（+10%）
+    records = [
+        _rec("BTC", 0.0, 100.0, 80.0),
+        _rec("BTC", 43200.0, 95.0, 75.0),
+        _rec("BTC", 86400.0, 110.0, 70.0),
+    ]
+    pair = backtest.evaluate_pairs(records, horizon_hours=24)[0]
+    assert pair["mae_pct"] == pytest.approx(-5.0)
+    assert pair["forward_pct"] == pytest.approx(10.0)
+
+
+def test_summarize_quantiles_and_quality_metrics():
+    pairs = [
+        {"symbol": "BTC", "score": 10.0 * i + 5.0, "forward_pct": i * 2.0 - 8.0, "mae_pct": -1.0}
+        for i in range(10)
+    ]
+    stats = backtest.summarize(pairs)
+    assert len(stats["quantiles"]) == backtest.QUANTILE_BUCKETS
+    assert stats["quantiles"][0]["avg_pct"] < 0 < stats["quantiles"][-1]["avg_pct"]
+    assert stats["hit_rate"] == pytest.approx(50.0)
+    assert stats["profit_factor"] is not None
+    assert stats["avg_mae"] == pytest.approx(-1.0)
+
+
+def test_run_supports_multiple_horizons(monkeypatch):
+    # 30 小时、每小时一条记录：4h 窗口有多个样本，24h 窗口只有 1 个
+    records = [
+        {**_rec("BTC", i * 3600.0, 100.0 + i, 60.0), "source": "watch"}
+        for i in range(31)
+    ]
+    monkeypatch.setattr(backtest.history, "iter_records", lambda: iter(records))
+    text = backtest.run(horizon_hours=[4, 24], source="watch")
+    assert "### 未来 4h" in text
+    assert "### 未来 24h" in text
+
+
+def test_weight_sensitivity_requires_dimension_scores(monkeypatch):
+    records = []
+    for i in range(6):
+        scores = {
+            "technical": 40.0 + i * 6.0,
+            "positioning": 55.0,
+            "liquidity": 50.0,
+            "sentiment": 45.0,
+            "macro": 50.0,
+        }
+        records.append(
+            {**_rec("BTC", i * 86400.0, 100.0 * (1.01 ** i), 56.0), "scores": scores, "source": "watch"}
+        )
+    monkeypatch.setattr(backtest.history, "iter_records", lambda: iter(records))
+    text = backtest.run(horizon_hours=24, source="watch", sweep_weights=True)
+    assert "权重敏感性" in text
+    assert "基线：Pearson r=" in text
+    assert "| technical |" in text
+
+
 def test_run_filters_by_source(monkeypatch):
     # 只有 watch 来源进入统计，brief 记录被忽略并给出提示
     records = [
@@ -112,4 +176,4 @@ def test_run_filters_by_source(monkeypatch):
     monkeypatch.setattr(backtest.history, "iter_records", lambda: iter(records))
     text = backtest.run(horizon_hours=24, source="watch")
     assert "已忽略 1 条" in text
-    assert "样本：1 个窗口" in text
+    assert "样本 1 个窗口" in text

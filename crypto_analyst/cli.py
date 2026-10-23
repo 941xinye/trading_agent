@@ -53,7 +53,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_push_test.add_argument("--card", action="store_true", help="发送 interactive 卡片样式而非纯文本")
 
     p_backtest = sub.add_parser("backtest", help="评分回测：用落盘快照检验综合分与未来收益的关系（离线）")
-    p_backtest.add_argument("--hours", type=float, default=24.0, help="未来收益窗口，默认 24 小时")
+    p_backtest.add_argument(
+        "--hours",
+        default="24",
+        help="未来收益窗口（小时），可逗号分隔多个：4,24,72，默认 24",
+    )
+    p_backtest.add_argument(
+        "--sweep",
+        action="store_true",
+        help="附加权重敏感性扫描（各维度 ±5pp 对相关系数的影响）",
+    )
     p_backtest.add_argument(
         "--source",
         choices=["watch", "brief", "snapshot", "ask", "all"],
@@ -114,7 +123,14 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_backtest(args: argparse.Namespace) -> int:
-    print(backtest.run(horizon_hours=args.hours, source=args.source))
+    horizons = [float(part) for part in str(args.hours).split(",") if part.strip()]
+    print(
+        backtest.run(
+            horizon_hours=horizons or 24.0,
+            source=args.source,
+            sweep_weights=args.sweep,
+        )
+    )
     return 0
 
 
