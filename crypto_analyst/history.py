@@ -17,8 +17,12 @@ def _dir() -> Path:
     return config.STATE_DIR / "snapshots"
 
 
-def append_snapshot(snapshot: Any) -> None:
-    """每个标的写一行（symbol 级粒度，回测按行流式读取）。"""
+def append_snapshot(snapshot: Any, source: str = "unknown") -> None:
+    """每个标的写一行（symbol 级粒度，回测按行流式读取）。
+
+    source 标记数据来源（watch / brief / snapshot / ask），回测默认只吃 watch，
+    避免手动调试与问答触发的快照混入样本。
+    """
     try:
         path = _dir() / time.strftime("%Y%m%d.jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -30,6 +34,7 @@ def append_snapshot(snapshot: Any) -> None:
                         {
                             "epoch": epoch,
                             "ts": snapshot.generated_at,
+                            "source": source,
                             "symbol": item.symbol,
                             "price": item.price,
                             "total_score": item.total_score,

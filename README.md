@@ -22,11 +22,11 @@
 | 情绪面 | 恐慌贪婪指数（当前值、1d/7d 变化、30日均值）+ 加密快讯 | alternative.me、Cointelegraph/Decrypt RSS |
 | 宏观联动 | 美元指数、纳斯达克100、标普500 的点位与 1d/5d 涨跌 | 东方财富公开行情 |
 
-三种交互方式全部实现：
+三类交互方式 + 一条推送通道全部实现：
 
 - **定时简报** `brief`：生成 Markdown 简报并落盘，可接系统计划任务；
 - **对话问答** `ask`：LLM 自主调用 7 个数据工具后作答；
-- **异动告警** `watch`：阈值触发 + 冷却去重 + Webhook 推送；
+- **异动告警** `watch`：阈值触发 + 冷却去重 + Webhook 推送，覆盖 24h 异动 / RSI 超买卖 / 支撑阻力测试与突破 / 资金费率拥挤与极端分位 / 持仓量异动 / 量能放大 / 评分状态切换 / 恐慌贪婪极端值 / 稳定币流出；
 - **飞书推送** `push-test` / `brief --push`：支持飞书自定义机器人 text 与 interactive 卡片消息，可选 HmacSHA256 加签。
 
 ## 三、系统架构
@@ -52,22 +52,28 @@ macro.py     ─┘                                   ├─> alerts.py  ──>
 目录结构：
 
 ```
-crypto-analyst/
+币分析助手/
 ├─ main.py                  # 入口
+├─ requirements.txt
 ├─ crypto_analyst/
 │  ├─ config.py             # 环境变量与权重配置
 │  ├─ net.py                # HTTP + 缓存 + 重试
 │  ├─ indicators.py         # 纯 Python 技术指标
 │  ├─ analysis.py           # 快照与五维评分
-│  ├─ tools.py              # Agent 工具层
+│  ├─ history.py            # 评分快照落盘（回测数据源，带 source 标记）
+│  ├─ backtest.py           # 非重叠窗口回测（综合分 vs 未来收益）
+│  ├─ tools.py              # Agent 工具层（支持 ask --symbols 作用域）
 │  ├─ agent.py              # LLM 工具调用循环
 │  ├─ prompts.py            # 人格与分析规范
 │  ├─ report.py             # Markdown 简报
-│  ├─ alerts.py             # 告警引擎
+│  ├─ alerts.py             # 告警引擎 + 飞书推送
 │  ├─ llm.py                # OpenAI 兼容客户端
+│  ├─ cli.py                # 命令行子命令
 │  └─ providers/            # 四类数据源
 │     └─ exchanges/         # 交易所适配：gate.py / binance.py，按 EXCHANGE 切换
-└─ reports/                 # 简报输出（自动创建）
+├─ scripts/                 # watch 守护进程 / 简报计划任务批处理
+├─ tests/                   # pytest 单测（indicators / backtest）
+└─ reports/                 # 简报、告警与运行日志（自动创建）
 ```
 
 ## 四、评分模型
@@ -77,12 +83,14 @@ crypto-analyst/
 | 维度 | 打分逻辑（0-100，50 为中性） |
 | --- | --- |
 | 技术面 | 按 1h/4h/1d 权重（0.2/0.35/0.45）累加：均线排列 ±18、MACD 柱方向与动能 ±9、结构 ±5、RSI 分区 ±8、放量确认 ±4 |
-| 持仓面 | 基准 50；资金费率年化 >80% 扣 25（多头拥挤）、负费率加 10（空头拥挤）；持仓量与价格同向加 8，增仓下跌扣 8；账户多空比 ≥2.2 扣 8；大户持仓偏空扣 5 |
+| 持仓面 | 基准 50；资金费率年化 >80% 扣 25、>30% 扣 15、>10% 扣 5、0~10% 加 5（依次对应多头拥挤程度）、负费率加 10（空头拥挤）；持仓量与价格同向加 8，增仓下跌扣 8；账户多空比 ≥2.2 扣 8；大户持仓偏空扣 5 |
 | 流动性 | 基准 50；稳定币 7d 变化 ×8（±20 封顶），30d 变化 ×3（±10 封顶） |
 | 情绪 | 恐慌贪婪指数原值；≥85 额外扣 10（追高风险），≤15 加 8（反向机会） |
 | 宏观 | 基准 50；美元指数 5d 反向 ×6（±15），纳指 5d ×2（±15），标普 ×1.5（±8） |
 
 状态映射：≥75 强势多头 / 62-75 偏多 / 45-62 震荡 / 32-45 偏空 / <32 弱势空头。
+
+情绪与资金费率的极端阈值统一来自 `config.THRESHOLDS`（`fng_extreme_greed=85`、`fng_extreme_fear=15`、`rsi_overbought=78` 等），评分、flags、告警共用同一份配置，调参只改一处。
 
 ## 五、Agent 工具清单
 
@@ -101,7 +109,7 @@ Agent 采用原生 Function Calling 循环（最多 6 步），工具异常会�
 ## 六、快速开始
 
 ```powershell
-cd crypto-analyst
+cd 币分析助手
 uv venv .venv
 uv pip install -r requirements.txt
 copy .env.example .env    # 按需填写 LLM_API_KEY
@@ -122,6 +130,7 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 
 # 3) 对话问答（需 LLM Key）
 .venv\Scripts\python.exe main.py ask "BTC 现在能追多吗？关键价位在哪"
+.venv\Scripts\python.exe main.py ask "ETH 和 SOL 哪个更强" --symbols ETH,SOL
 
 # 4) 异动监控（先跑一轮验证）
 .venv\Scripts\python.exe main.py watch --once
@@ -130,7 +139,16 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 # 5) 推送链路自检
 .venv\Scripts\python.exe main.py push-test          # 纯文本
 .venv\Scripts\python.exe main.py push-test --card   # 飞书卡片
+
+# 6) 评分回测（离线，用历史落盘快照检验"综合分 vs 未来收益"）
+.venv\Scripts\python.exe main.py backtest                    # 默认 24h 窗口、只统计 watch 来源
+.venv\Scripts\python.exe main.py backtest --hours 4          # 换 4h 窗口
+.venv\Scripts\python.exe main.py backtest --source all       # 全量来源（含 brief / ask / 调试快照）
 ```
+
+每次 `brief` / `watch` / `snapshot` / `ask` 运行后，评分快照会自动追加到 `.state/snapshots/YYYYMMDD.jsonl`（每个标的一行，并带 `source` 标记区分来源）。
+
+回测采用**非重叠窗口采样**：每个 `horizon` 窗口只取该窗口起点的一条记录作为样本，未来价格必须落在目标时刻 ±0.5×horizon 内，数据断档的窗口直接丢弃。因此样本量口径是"有效窗口数"而非"记录配对数"——挂 `watch` 时每标的每 24h 最多 1 个样本，攒够 30 个窗口（约 10 天 × 3 标的）再解读 Pearson 相关系数才有意义。
 
 ## 七、配置项（.env）
 
@@ -141,6 +159,12 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 | `BINANCE_SPOT_BASE` | `https://data-api.binance.vision` | Binance 现货接口地址 |
 | `BINANCE_FUTURES_BASE` | `https://fapi.binance.com` | Binance 永续接口地址，不可达时可指向自建代理 |
 | `TIMEFRAMES` | `1h,4h,1d` | 分析周期 |
+| `QUOTE` | `USDT` | 计价货币（影响交易对拼装与 symbol 归一化） |
+| `KLINE_LIMIT` | `300` | 每次拉取的 K 线根数，越大指标越稳、请求越重 |
+| `HTTP_TIMEOUT` | `12` | 单次 HTTP 请求超时（秒） |
+| `CACHE_DIR` | `.cache` | HTTP 磁盘缓存目录 |
+| `STATE_DIR` | `.state` | 告警冷却状态、评分快照目录 |
+| `REPORT_DIR` | `reports` | 简报、告警日志输出目录 |
 | `LLM_BASE_URL` | `https://api.deepseek.com` | 任意 OpenAI 兼容接口 |
 | `LLM_API_KEY` | 空 | 留空则只跑规则引擎 |
 | `LLM_MODEL` | `deepseek-chat` | 模型名 |
@@ -175,8 +199,60 @@ Binance 说明：
 3. 跑 `main.py push-test` 发一条文本验证连通，再跑 `main.py push-test --card` 验证卡片样式；
 4. 日常使用：
    - `brief --push` 把行情简报以卡片形式推送到群里（含结论速览 / 分析师点评 / 温度计 / 关键价位与异动 / 数据缺口）；
-   - `watch` 监控触发阈值时自动推送文本告警，享受冷却去重；
+   - `watch` 监控触发阈值时自动推送文本告警，享受冷却去重；告警同时追加到 `reports/alerts.log`，推送失败也能回溯；
    - 非飞书机器人（如钉钉）自动降级为纯文本。
+
+### 定时推送（Windows 计划任务）
+
+仓库自带 [scripts/brief_push_task.bat](scripts/brief_push_task.bat) 作为任务入口（**任务本身的注册属于本机状态，不在版本库内**）。本机已注册两条每日任务：
+
+- `CryptoAnalyst\BriefPushMorning`：每日 09:00
+- `CryptoAnalyst\BriefPushEvening`：每日 21:00
+
+执行日志写到 `reports\brief_task.log`。
+
+> **注意：** 这两条任务当前的登录模式是 `Interactive only`（`schtasks /Query /V` 可见），**用户未登录时不会执行**。需要真正无人值守时，要改成"不管用户是否登录都运行"并在任务里配置凭据。
+
+管理命令：
+
+```powershell
+schtasks /Query /TN "CryptoAnalyst\BriefPushMorning"        # 查看状态
+schtasks /Run /TN "CryptoAnalyst\BriefPushMorning"          # 立即触发一次
+schtasks /Delete /TN "CryptoAnalyst\BriefPushMorning" /F    # 删除
+```
+
+退出码约定：`0` 表示简报+推送全部成功；`3` 表示简报已落盘但推送失败；`1`/`2` 表示简报本身失败。
+
+### watch 常驻（攒回测样本）
+
+`watch` 需要长时间挂起才能攒够回测样本（≥30 个有效窗口，约 10 天 × 3 标的）。仓库提供 4 个脚本：
+
+| 脚本 | 用途 |
+| --- | --- |
+| [scripts/watch_daemon.ps1](scripts/watch_daemon.ps1) | 守护循环本体：自动重启 + 日志轮转 + PID 管理 + 单实例保护 |
+| [scripts/watch_start.ps1](scripts/watch_start.ps1) | 以隐藏窗口启动 daemon（当前会话内有效） |
+| [scripts/watch_stop.ps1](scripts/watch_stop.ps1) | 停止 daemon 及其全部子孙进程 |
+| [scripts/watch_register_task.ps1](scripts/watch_register_task.ps1) | 注册"登录自启"；权限不足时自动降级到 Startup 文件夹快捷方式 |
+
+**典型用法**：
+
+```powershell
+# 当前会话临时跑（关闭当前 PowerShell 窗口即停止）
+powershell -File scripts\watch_start.ps1
+
+# 注册登录自启（推荐，开机/重登后自动拉起）
+powershell -File scripts\watch_register_task.ps1
+
+# 查看运行状态
+Get-Content reports\watch.log -Tail 20
+
+# 停止
+powershell -File scripts\watch_stop.ps1
+```
+
+**守护参数**（默认值见脚本头部）：`-Interval 300` 轮询间隔；`-MaxLogMB 5` 日志轮转阈值；`-MaxCrashPerHour 6` 崩溃熔断。
+
+**已知限制**：在 Trae / VS Code 集成终端里启动的 daemon 会随终端会话一起被回收，因此请务必在**独立的 Windows PowerShell 窗口**里运行 `watch_start.ps1`，或直接依赖 Startup 快捷方式实现开机自启。
 
 ## 八、扩展方式
 
@@ -193,7 +269,8 @@ Binance 说明：
 - **交易所净流入/流出**需要 CryptoQuant / Glassnode 付费 Key，当前用"稳定币供应 + 持仓结构"近似替代，需接入时在 `providers/onchain.py` 增加即可；
 - 新闻为英文 RSS（国内中文快讯接口多数需要签名鉴权），标题可直接交给 LLM 翻译与筛选；
 - 资金费率分位基于当前所选交易所（Gate / Binance）永续近 90 天结算数据，不含其他交易所；
-- 当前不含回测模块，评分权重为经验值，建议先用 `snapshot` 积累数据后再校准。
+- 回测基于落盘快照做"评分 vs 未来收益"的分桶统计与相关性检验，采用非重叠窗口采样（每窗口一个样本、允许 0.5×horizon 的价格滞后、断档窗口丢弃）。它只能回答"评分当时是否有预测力"，不能替代逐根 K 线的策略回测；后者可在 `backtest.py` 之上扩展。
+- 回测只统计 `source=watch` 的记录（可用 `--source all` 放开），因此样本积累速度受 watch 运行时长限制：3 个标的每天最多 3 个 24h 窗口。
 
 ## 免责声明
 

@@ -80,7 +80,10 @@ def get_json(
         cached = _load_cache(key, ttl)
         if cached is not None:
             return cached
-    data = _request(url, params, retries, timeout).json()
+    try:
+        data = _request(url, params, retries, timeout).json()
+    except ValueError as exc:  # 接口返回非 JSON（限流页/HTML 错误页）时统一转成 RuntimeError
+        raise RuntimeError(f"响应解析失败 {url}: {exc}") from exc
     if ttl > 0:
         _save_cache(key, data)
     return data

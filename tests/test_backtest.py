@@ -57,7 +57,7 @@ def test_summarize_buckets_and_verdict_path():
         records.append(_rec("BTC", t, 100.0, 80.0))           # 强势多头
         records.append(_rec("BTC", t + 86400.0, 110.0, 60.0))
         records.append(_rec("ETH", t, 50.0, 20.0))            # 弱势空头
-        records.append(_rec("ETH", t + 86400.0, 45.0, 30.0))
+        records.append(_rec("ETH", t + 86400.0, 45.0, 50.0))  # 中继记录用中性分，避免串桶
     pairs = backtest.evaluate_pairs(records, horizon_hours=24)
     stats = backtest.summarize(pairs)
     by_regime = {row["regime"]: row for row in stats["buckets"]}
@@ -73,3 +73,43 @@ def test_run_without_data(tmp_path, monkeypatch):
     monkeypatch.setattr(backtest.history, "iter_records", lambda: iter([]))
     text = backtest.run()
     assert "暂无可用样本对" in text
+
+
+def test_evaluate_pairs_no_overlap():
+    # 每 5 分钟一条记录、跨度 30h：24h 窗口只能产出 1 个样本，而不是数百个重叠样本
+    records = [_rec("BTC", i * 300.0, 100.0 + i, 60.0) for i in range(361)]
+    pairs = backtest.evaluate_pairs(records, horizon_hours=24)
+    assert len(pairs) == 1
+    assert pairs[0]["lag_hours"] == pytest.approx(0.0)
+
+
+def test_evaluate_pairs_drops_long_gap():
+    # 数据断档 72h：24h 窗口的目标时刻没有可信价格，样本应被丢弃
+    records = [_rec("BTC", 0.0, 100.0, 80.0), _rec("BTC", 72 * 3600.0, 110.0, 60.0)]
+    assert backtest.evaluate_pairs(records, horizon_hours=24) == []
+
+
+def test_evaluate_pairs_resumes_after_gap():
+    # 断档后仍可重新开窗：0h → 72h（丢弃），72h → 96h（有效）
+    records = [
+        _rec("BTC", 0.0, 100.0, 80.0),
+        _rec("BTC", 72 * 3600.0, 110.0, 60.0),
+        _rec("BTC", 96 * 3600.0, 121.0, 55.0),
+    ]
+    pairs = backtest.evaluate_pairs(records, horizon_hours=24)
+    assert len(pairs) == 1
+    assert pairs[0]["score"] == 60.0
+    assert pairs[0]["forward_pct"] == pytest.approx(10.0)
+
+
+def test_run_filters_by_source(monkeypatch):
+    # 只有 watch 来源进入统计，brief 记录被忽略并给出提示
+    records = [
+        {**_rec("BTC", 0.0, 100.0, 80.0), "source": "watch"},
+        {**_rec("BTC", 86400.0, 110.0, 60.0), "source": "watch"},
+        {**_rec("BTC", 3600.0, 99.0, 20.0), "source": "brief"},
+    ]
+    monkeypatch.setattr(backtest.history, "iter_records", lambda: iter(records))
+    text = backtest.run(horizon_hours=24, source="watch")
+    assert "已忽略 1 条" in text
+    assert "样本：1 个窗口" in text

@@ -8,7 +8,17 @@ from . import analysis, config
 from .providers import macro, market, onchain, sentiment
 
 _SNAPSHOT_TTL = 60
-_snapshot_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+_snapshot_cache: dict[str, Any] = {"ts": 0.0, "data": None, "scope": None}
+# 当前问答会话的标的作用域（ask --symbols 覆盖），None 表示使用 config.SYMBOLS
+_SCOPE: list[str] | None = None
+
+
+def set_symbol_scope(symbols: list[str] | None) -> list[str] | None:
+    """设置本次会话的标的作用域，返回旧值以便恢复。"""
+    global _SCOPE
+    previous = _SCOPE
+    _SCOPE = [s.upper() for s in symbols] if symbols else None
+    return previous
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -17,16 +27,28 @@ def _normalize_symbol(symbol: str) -> str:
 
 def _get_snapshot() -> analysis.MarketSnapshot:
     now = time.time()
-    if _snapshot_cache["data"] is None or now - _snapshot_cache["ts"] > _SNAPSHOT_TTL:
-        _snapshot_cache["data"] = analysis.build_snapshot()
+    scope = tuple(_SCOPE) if _SCOPE else None
+    cache_invalid = (
+        _snapshot_cache["data"] is None
+        or now - _snapshot_cache["ts"] > _SNAPSHOT_TTL
+        or _snapshot_cache["scope"] != scope
+    )
+    if cache_invalid:
+        _snapshot_cache["data"] = analysis.build_snapshot(
+            symbols=list(scope) if scope else None, source="ask"
+        )
         _snapshot_cache["ts"] = now
+        _snapshot_cache["scope"] = scope
     return _snapshot_cache["data"]
 
 
 def _market_overview(symbols: list[str] | None = None) -> dict[str, Any]:
     snapshot = _get_snapshot()
+    wanted = {s.upper() for s in symbols} if symbols else None
     rows = []
     for item in snapshot.symbols:
+        if wanted and item.symbol not in wanted:
+            continue
         rows.append(
             {
                 "symbol": item.symbol,

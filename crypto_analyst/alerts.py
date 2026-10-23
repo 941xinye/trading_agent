@@ -11,7 +11,7 @@ from typing import Any
 
 import requests
 
-from . import analysis, config
+from . import analysis, config, history
 
 
 def _state_path():
@@ -25,7 +25,8 @@ def _load_state() -> dict[str, float]:
         return {}
     try:
         return json.loads(path.read_text("utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        print(f"[告警] 状态文件损坏，已重置冷却记录：{path}（{exc}）")
         return {}
 
 
@@ -36,16 +37,48 @@ def _save_state(state: dict[str, float]) -> None:
         pass
 
 
+def _previous_regimes(source: str = "watch") -> dict[str, str]:
+    """从历史快照中读取每个标的"上一次"的 regime（即倒数第二条记录）。
+
+    build_snapshot 在 evaluate 之前已把本轮写入历史，因此需要跳过最新一条。
+    只比较同一来源的记录，避免手动 brief / snapshot 改动影响告警判定。
+    """
+    latest: dict[str, str] = {}
+    previous: dict[str, str] = {}
+    for rec in history.iter_records():
+        if rec.get("source") != source:
+            continue
+        symbol = rec.get("symbol")
+        regime = rec.get("regime")
+        if not symbol or not regime:
+            continue
+        if symbol in latest:
+            previous[symbol] = latest[symbol]
+        latest[symbol] = regime
+    return previous
+
+
 def evaluate(snapshot: analysis.MarketSnapshot) -> list[dict[str, Any]]:
     """生成告警候选，并按冷却时间过滤。"""
     th = config.THRESHOLDS
     candidates: list[dict[str, Any]] = []
+    prev_regimes = _previous_regimes("watch")
 
     def add(key: str, level: str, message: str) -> None:
         candidates.append({"key": key, "level": level, "message": message})
 
     for item in snapshot.symbols:
         symbol = item.symbol
+
+        # 评分状态切换：与上一次落盘的 regime 不同时触发（结构性信号）
+        prev_regime = prev_regimes.get(symbol)
+        if prev_regime and prev_regime != item.regime:
+            add(
+                f"{symbol}:regime_shift",
+                "warning",
+                f"{symbol} 评分状态切换：{prev_regime} → {item.regime}（{item.total_score:.0f}分）",
+            )
+
         if abs(item.change_24h_pct) >= th["move_24h_pct"]:
             add(
                 f"{symbol}:move24h",
@@ -63,7 +96,19 @@ def evaluate(snapshot: analysis.MarketSnapshot) -> list[dict[str, Any]]:
         if day and day.resistance and day.support:
             to_resistance = (day.resistance / item.price - 1) * 100
             to_support = (item.price / day.support - 1) * 100
-            if 0 <= to_resistance <= th["level_alert_pct"]:
+            if item.price > day.resistance:
+                add(
+                    f"{symbol}:break_resistance",
+                    "warning",
+                    f"{symbol} 已突破日线阻力 {day.resistance:,.2f}，当前 {item.price:,.2f}（+{(item.price/day.resistance-1)*100:.2f}%）",
+                )
+            elif item.price < day.support:
+                add(
+                    f"{symbol}:break_support",
+                    "warning",
+                    f"{symbol} 已跌破日线支撑 {day.support:,.2f}，当前 {item.price:,.2f}（{(item.price/day.support-1)*100:.2f}%）",
+                )
+            elif 0 <= to_resistance <= th["level_alert_pct"]:
                 add(
                     f"{symbol}:test_resistance",
                     "info",
@@ -83,6 +128,19 @@ def evaluate(snapshot: analysis.MarketSnapshot) -> list[dict[str, Any]]:
                 add(f"{symbol}:funding_hot", "warning", f"{symbol} 资金费率年化 {funding:.0f}%，多头拥挤")
             elif funding is not None and funding < th["funding_crowded_short"]:
                 add(f"{symbol}:funding_short", "info", f"{symbol} 资金费率年化 {funding:.0f}%，空头拥挤")
+            funding_pctl = deriv.get("funding_percentile")
+            if funding_pctl is not None and funding_pctl >= th["funding_pctl_hot"]:
+                add(
+                    f"{symbol}:funding_pctl_hot",
+                    "warning",
+                    f"{symbol} 资金费率历史分位 {funding_pctl:.0f}%，处于 90 日极端拥挤区间",
+                )
+            elif funding_pctl is not None and funding_pctl <= th["funding_pctl_cold"]:
+                add(
+                    f"{symbol}:funding_pctl_cold",
+                    "info",
+                    f"{symbol} 资金费率历史分位 {funding_pctl:.0f}%，处于 90 日极端冷清区间，警惕逼空",
+                )
             oi_change = deriv.get("oi_change_1h_pct")
             if oi_change is not None and abs(oi_change) >= th["oi_alert_pct"]:
                 direction = "增仓" if oi_change > 0 else "减仓"
@@ -297,6 +355,17 @@ def build_brief_card(
     }
 
 
+def append_alert_log(text: str) -> None:
+    """把本轮告警追加到 reports/alerts.log，推送失败时仍可按时间回溯。"""
+    try:
+        path = config.REPORT_DIR / "alerts.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError:
+        pass
+
+
 def format_alerts(alerts: list[dict[str, Any]]) -> str:
     if not alerts:
         return "本轮无触发告警。"
@@ -313,11 +382,12 @@ def run_watch(interval: int | None = None, once: bool = False) -> None:
     print(f"异动监控启动，轮询间隔 {interval}s，冷却 {config.ALERT_COOLDOWN}s（Ctrl+C 退出）")
     while True:
         try:
-            snapshot = analysis.build_snapshot(include_news=False)
+            snapshot = analysis.build_snapshot(include_news=False, source="watch")
             alerts = evaluate(snapshot)
             text = format_alerts(alerts)
-            print(text)
+            print(text, flush=True)
             if alerts:
+                append_alert_log(text)
                 push(text)
         except KeyboardInterrupt:
             print("\n已停止监控。")

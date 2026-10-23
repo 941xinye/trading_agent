@@ -428,7 +428,11 @@ def build_symbol_snapshot(
     )
 
 
-def build_snapshot(symbols: list[str] | None = None, include_news: bool = True) -> MarketSnapshot:
+def build_snapshot(
+    symbols: list[str] | None = None,
+    include_news: bool = True,
+    source: str = "unknown",
+) -> MarketSnapshot:
     symbols = [s.upper() for s in (symbols or config.SYMBOLS)]
     warnings: list[str] = []
 
@@ -439,31 +443,32 @@ def build_snapshot(symbols: list[str] | None = None, include_news: bool = True) 
         fut_macro = pool.submit(macro_provider.macro_overview)
         fut_news = pool.submit(sentiment.news) if include_news else None
 
+        # 数据源兜底统一捕获 Exception：解析异常（JSON 结构变化）同样只记缺口，不中断整体流程
         try:
             stable = fut_stable.result()
-        except RuntimeError as exc:
+        except Exception as exc:
             stable = {}
             warnings.append(f"稳定币数据获取失败: {exc}")
         try:
             btc = fut_btc.result()
-        except RuntimeError as exc:
+        except Exception as exc:
             btc = {}
             warnings.append(f"BTC 网络数据获取失败: {exc}")
         try:
             fng = fut_fng.result()
-        except RuntimeError as exc:
+        except Exception as exc:
             fng = {}
             warnings.append(f"恐慌贪婪指数获取失败: {exc}")
         try:
             macro_data = fut_macro.result()
-        except RuntimeError as exc:
+        except Exception as exc:
             macro_data = {}
             warnings.append(f"宏观数据获取失败: {exc}")
         news_items: list[dict[str, Any]] = []
         if fut_news:
             try:
                 news_items = fut_news.result()
-            except RuntimeError as exc:
+            except Exception as exc:
                 warnings.append(f"新闻获取失败: {exc}")
 
         def _safe(symbol: str) -> SymbolSnapshot | None:
@@ -487,5 +492,5 @@ def build_snapshot(symbols: list[str] | None = None, include_news: bool = True) 
         macro=macro_data,
         warnings=warnings,
     )
-    history.append_snapshot(snapshot)  # 落盘积累时间序列，供 backtest 校准评分
+    history.append_snapshot(snapshot, source=source)  # 落盘积累时间序列，供 backtest 校准评分
     return snapshot

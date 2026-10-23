@@ -66,6 +66,9 @@ THRESHOLDS = {
     "fng_extreme_fear": 15,
     # 稳定币 7d 变化（%，流出告警）
     "stable_outflow_7d_pct": -1.0,
+    # 资金费率历史分位（%，极端拥挤告警）
+    "funding_pctl_hot": 90.0,
+    "funding_pctl_cold": 10.0,
 }
 
 # 网络与缓存

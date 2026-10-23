@@ -54,12 +54,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_backtest = sub.add_parser("backtest", help="评分回测：用落盘快照检验综合分与未来收益的关系（离线）")
     p_backtest.add_argument("--hours", type=float, default=24.0, help="未来收益窗口，默认 24 小时")
+    p_backtest.add_argument(
+        "--source",
+        choices=["watch", "brief", "snapshot", "ask", "all"],
+        default="watch",
+        help="只统计该来源的快照，默认 watch（持续采集，样本最干净）；all 为全量",
+    )
 
     return parser
 
 
 def _cmd_brief(args: argparse.Namespace) -> int:
-    snapshot = analysis.build_snapshot(symbols=_parse_symbols(args.symbols))
+    snapshot = analysis.build_snapshot(symbols=_parse_symbols(args.symbols), source="brief")
     if not snapshot.symbols:
         print("未获取到任何标的，请检查 CACHE_DIR / 网络。", file=sys.stderr)
         return 1
@@ -77,22 +83,24 @@ def _cmd_brief(args: argparse.Namespace) -> int:
     if args.stdout:
         print(text)
     print(f"简报已保存：{path}")
+    push_failed = False
     if args.push:
         card = alerts.build_brief_card(snapshot, commentary=commentary, report_path=path)
         if alerts.push_card(card):
             print("已推送到飞书。")
         else:
-            print("推送失败，请检查 WEBHOOK_URL / WEBHOOK_SECRET 配置。", file=sys.stderr)
-            return 2
+            print("推送失败（简报已正常落盘），请检查 WEBHOOK_URL / WEBHOOK_SECRET 配置。", file=sys.stderr)
+            push_failed = True
     if snapshot.warnings:
         print("数据缺口：" + "；".join(snapshot.warnings))
-    return 0
+    # 退出码：0 全部成功；3 简报成功但推送失败（便于计划任务区分对待）
+    return 3 if push_failed else 0
 
 
 def _cmd_ask(args: argparse.Namespace) -> int:
     analyst = MarketAnalyst()
     try:
-        answer = analyst.ask(args.question)
+        answer = analyst.ask(args.question, symbols=_parse_symbols(args.symbols))
     except LLMError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -106,7 +114,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_backtest(args: argparse.Namespace) -> int:
-    print(backtest.run(horizon_hours=args.hours))
+    print(backtest.run(horizon_hours=args.hours, source=args.source))
     return 0
 
 
@@ -151,7 +159,7 @@ def _cmd_push_test(args: argparse.Namespace) -> int:
 
 
 def _cmd_snapshot(args: argparse.Namespace) -> int:
-    snapshot = analysis.build_snapshot(symbols=_parse_symbols(args.symbols))
+    snapshot = analysis.build_snapshot(symbols=_parse_symbols(args.symbols), source="snapshot")
     payload = snapshot.to_dict()
     text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
     if args.out:
