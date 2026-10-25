@@ -335,6 +335,7 @@ curl.exe -X POST "http://127.0.0.1:8080/ask" -H "Content-Type: application/json"
 | [scripts/watch_start.ps1](scripts/watch_start.ps1) | 以隐藏窗口启动 daemon（当前会话内有效） |
 | [scripts/watch_stop.ps1](scripts/watch_stop.ps1) | 停止 daemon 及其全部子孙进程 |
 | [scripts/watch_register_task.ps1](scripts/watch_register_task.ps1) | 注册"登录自启"；权限不足时自动降级到 Startup 文件夹快捷方式 |
+| [scripts/feishu_start.ps1](scripts/feishu_start.ps1) | 飞书双向机器人一键启动：拉起 feishu-hook + cpolar 隧道，打印本次公网回调地址，域名变更时提醒更新飞书后台（`-Stop` 停止） |
 
 **典型用法**：
 
