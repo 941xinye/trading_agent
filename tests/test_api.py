@@ -16,11 +16,13 @@ def test_health_ok(monkeypatch):
     assert data["exchange"] == config.EXCHANGE
 
 
-def test_token_required_when_configured(monkeypatch):
+def test_health_always_public(monkeypatch):
+    # /health 始终公开，便于容器健康检查；即使配置了 API_TOKEN 也不鉴权
     monkeypatch.setattr(config, "API_TOKEN", "s3cret")
-    assert api.dispatch("GET", "/health", {}, b"", {})[0] == 401
-    assert api.dispatch("GET", "/health", {}, b"", {"x-api-token": "s3cret"})[0] == 200
-    assert api.dispatch("GET", "/health", {}, b"", {"authorization": "Bearer s3cret"})[0] == 200
+    assert api.dispatch("GET", "/health", {}, b"", {})[0] == 200
+    # 其他接口仍需鉴权
+    assert api.dispatch("GET", "/snapshot", {}, b"", {})[0] == 401
+    assert api.dispatch("GET", "/snapshot", {}, b"", {"x-api-token": "s3cret"})[0] != 401
 
 
 def test_snapshot_passes_symbols_and_source(monkeypatch):
@@ -90,6 +92,29 @@ def test_ask_returns_answer(monkeypatch):
     status, _ctype, payload = api.dispatch("POST", "/ask", {}, body, {})
     assert status == 200
     assert json.loads(payload)["answer"] == "Q=BTC?;S=['BTC', 'ETH']"
+
+
+def test_ask_rejects_when_concurrent_limit_reached(monkeypatch):
+    monkeypatch.setattr(config, "API_TOKEN", "")
+    monkeypatch.setattr(api, "_ask_in_flight", api.MAX_CONCURRENT_ASK)
+
+    body = json.dumps({"question": "BTC?"}).encode("utf-8")
+    status, _ctype, payload = api.dispatch("POST", "/ask", {}, body, {})
+    assert status == 429
+    assert "繁忙" in json.loads(payload)["error"]
+
+
+def test_ask_returns_504_on_timeout(monkeypatch):
+    monkeypatch.setattr(config, "API_TOKEN", "")
+
+    def raise_timeout(question, symbols):
+        raise api._AskTimeout()
+
+    monkeypatch.setattr(api, "_ask_with_timeout", raise_timeout)
+    body = json.dumps({"question": "BTC?"}).encode("utf-8")
+    status, _ctype, payload = api.dispatch("POST", "/ask", {}, body, {})
+    assert status == 504
+    assert "超时" in json.loads(payload)["error"]
 
 
 def test_unknown_route(monkeypatch):

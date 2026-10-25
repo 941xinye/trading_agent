@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -24,9 +25,13 @@ from . import config
 from .agent import MarketAnalyst
 from .llm import LLMError
 
+logger = logging.getLogger(__name__)
+
 MAX_ANSWER_CHARS = 4000
 EVENT_TTL_SECONDS = 3600
 MAX_SEEN_EVENTS = 1000
+# 会话上下文保留时长：超过此时长未活跃的会话自动清理，避免内存无限增长
+SESSION_TTL_SECONDS = 30 * 60
 _MENTION_PATTERN = re.compile(r"@_user_\d+")
 
 _TOKEN_LOCK = threading.Lock()
@@ -34,6 +39,9 @@ _TOKEN_VALUE = ""
 _TOKEN_EXPIRES_AT = 0.0
 _SEEN_EVENTS: dict[str, float] = {}
 _SEEN_LOCK = threading.Lock()
+# 会话池：chat_id -> (MarketAnalyst 实例, 最后活跃时间戳)
+_SESSIONS: dict[str, tuple[MarketAnalyst, float]] = {}
+_SESSIONS_LOCK = threading.Lock()
 
 
 def extract_question(payload: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -73,12 +81,40 @@ def _should_process(event_id: str, now: float | None = None) -> bool:
     return True
 
 
-def answer_question(question: str) -> str:
-    """调用 Agent 生成回答；未配置 LLM 时给出明确提示而不是静默失败。"""
+def _get_session(chat_id: str) -> MarketAnalyst:
+    """获取或创建会话实例，更新最后活跃时间，并清理过期会话。"""
+    now = time.time()
+    with _SESSIONS_LOCK:
+        # 先清理过期会话
+        expired = [cid for cid, (_analyst, active_at) in _SESSIONS.items() if now - active_at > SESSION_TTL_SECONDS]
+        for cid in expired:
+            del _SESSIONS[cid]
+
+        session = _SESSIONS.get(chat_id)
+        if session is None or now - session[1] > SESSION_TTL_SECONDS:
+            analyst = MarketAnalyst()
+            _SESSIONS[chat_id] = (analyst, now)
+            return analyst
+        analyst, _ = session
+        _SESSIONS[chat_id] = (analyst, now)
+        return analyst
+
+
+def reset_session(chat_id: str) -> None:
+    """清除指定会话的上下文（用户要求重置时调用）。"""
+    with _SESSIONS_LOCK:
+        _SESSIONS.pop(chat_id, None)
+
+
+def answer_question(question: str, chat_id: str | None = None) -> str:
+    """调用 Agent 生成回答；chat_id 不为空时复用会话上下文实现多轮对话。"""
     if not config.LLM_API_KEY:
         return "未配置 LLM_API_KEY，暂时无法回答。请在 .env 中填写后重启 feishu-hook。"
     try:
-        return MarketAnalyst().ask(question, symbols=None)
+        if chat_id:
+            analyst = _get_session(chat_id)
+            return analyst.chat(question)  # 多轮：保留历史
+        return MarketAnalyst().ask(question, symbols=None)  # 单轮
     except LLMError as exc:
         return f"回答失败：{exc}"
     except Exception as exc:  # 网络/解析异常都不应让机器人崩溃
@@ -108,7 +144,7 @@ def _tenant_token() -> str:
 def send_text(chat_id: str, text: str) -> bool:
     """以机器人身份向会话发送文本消息。"""
     if not config.FEISHU_APP_ID or not config.FEISHU_APP_SECRET:
-        print("[飞书] 未配置 FEISHU_APP_ID / FEISHU_APP_SECRET，无法回复。", flush=True)
+        logger.warning("未配置 FEISHU_APP_ID / FEISHU_APP_SECRET，无法回复。")
         return False
     body = text if len(text) <= MAX_ANSWER_CHARS else text[: MAX_ANSWER_CHARS - 1] + "…"
     try:
@@ -126,17 +162,17 @@ def send_text(chat_id: str, text: str) -> bool:
         )
         data = resp.json() if resp.content else {}
         if resp.status_code >= 400 or data.get("code") != 0:
-            print(f"[飞书] 回复失败 HTTP {resp.status_code}: {data.get('msg') or resp.text[:200]}", flush=True)
+            logger.warning("回复失败 HTTP %s: %s", resp.status_code, data.get("msg") or resp.text[:200])
             return False
         return True
     except Exception as exc:
-        print(f"[飞书] 回复异常: {exc}", flush=True)
+        logger.warning("回复异常: %s", exc)
         return False
 
 
 def process_payload(
     payload: dict[str, Any],
-    answer_fn: Callable[[str], str] = answer_question,
+    answer_fn: Callable[[str, str | None], str] = answer_question,
     reply_fn: Callable[[str, str], bool] = send_text,
 ) -> dict[str, Any]:
     """处理一次事件回调，返回给飞书的响应体（验证 challenge / 受理确认 / 错误）。"""
@@ -160,8 +196,14 @@ def process_payload(
         return {"code": 0}
     chat_id, _chat_type, question = parsed
 
-    print(f"[飞书] 收到提问：{question}", flush=True)
-    answer = answer_fn(question)
+    # 支持用户主动重置上下文
+    if question.strip() in ("重置", "reset", "/reset"):
+        reset_session(chat_id)
+        reply_fn(chat_id, "上下文已重置，可以开始新的话题。")
+        return {"code": 0}
+
+    logger.info("收到提问：%s", question)
+    answer = answer_fn(question, chat_id)
     reply_fn(chat_id, answer)
     return {"code": 0}
 
@@ -213,27 +255,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"[飞书] {self.address_string()} {fmt % args}", flush=True)
+        logger.info("%s %s", self.address_string(), fmt % args)
 
 
 def serve(host: str | None = None, port: int | None = None) -> None:
     host = host or config.FEISHU_BOT_HOST
     port = port or config.FEISHU_BOT_PORT
     if not config.FEISHU_APP_ID or not config.FEISHU_APP_SECRET:
-        print(
-            "未配置 FEISHU_APP_ID / FEISHU_APP_SECRET，机器人无法回复；"
-            "仍会启动回调服务用于验证地址。",
-            flush=True,
-        )
+        logger.warning("未配置 FEISHU_APP_ID / FEISHU_APP_SECRET，机器人无法回复；仍会启动回调服务用于验证地址。")
     server = ThreadingHTTPServer((host, port), _Handler)
-    print(
-        f"飞书事件回调已启动：http://{host}:{port}/feishu/event  "
-        f"（订阅 im.message.receive_v1，Ctrl+C 退出）",
-        flush=True,
-    )
+    logger.info("飞书事件回调已启动：http://%s:%s/feishu/event （订阅 im.message.receive_v1）", host, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n飞书回调已停止。", flush=True)
+        logger.info("飞书回调已停止。")
     finally:
         server.server_close()

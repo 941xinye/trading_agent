@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import time
 from datetime import datetime
 
 import pytest
@@ -161,3 +162,61 @@ def test_cooldown_blocks_repeat_and_prefixes_exchange(monkeypatch, snapshot_fact
 
     second = alerts.evaluate(snapshot)
     assert second == []
+
+
+def test_escalate_warnings_to_critical_after_threshold(monkeypatch):
+    alerts._warning_counts.clear()
+    items = [
+        {"symbol": "BTC", "level": "warning", "message": "m1"},
+        {"symbol": "BTC", "level": "warning", "message": "m2"},
+        {"symbol": "BTC", "level": "warning", "message": "m3"},
+    ]
+    result = alerts._escalate(items)
+    assert all(item["level"] == "critical" for item in result)
+    assert all("[升级]" in item["message"] for item in result)
+
+
+def test_escalate_does_not_trigger_below_threshold(monkeypatch):
+    alerts._warning_counts.clear()
+    items = [
+        {"symbol": "BTC", "level": "warning", "message": "m1"},
+        {"symbol": "ETH", "level": "warning", "message": "m2"},
+    ]
+    result = alerts._escalate(items)
+    assert all(item["level"] == "warning" for item in result)
+
+
+def test_flush_pending_waits_for_window(monkeypatch):
+    alerts._pending_alerts.clear()
+    alerts._pending_alerts.append({"symbol": "BTC", "level": "warning", "message": "m"})
+    alerts._last_batch_push = time.time()
+    pushed = []
+    monkeypatch.setattr(alerts, "push", lambda text: pushed.append(text) or True)
+
+    alerts._flush_pending()  # 窗口内，不推送
+    assert pushed == []
+    assert alerts._pending_alerts  # 仍在缓存
+
+
+def test_flush_pending_pushes_critical_immediately(monkeypatch):
+    alerts._pending_alerts.clear()
+    alerts._pending_alerts.append({"symbol": "BTC", "level": "critical", "message": "m"})
+    alerts._last_batch_push = time.time()
+    pushed = []
+    monkeypatch.setattr(alerts, "push", lambda text: pushed.append(text) or True)
+
+    alerts._flush_pending()  # critical 立即推送
+    assert len(pushed) == 1
+    assert alerts._pending_alerts == []
+
+
+def test_flush_pending_force_empties_buffer(monkeypatch):
+    alerts._pending_alerts.clear()
+    alerts._pending_alerts.append({"symbol": "BTC", "level": "warning", "message": "m"})
+    alerts._last_batch_push = time.time()
+    pushed = []
+    monkeypatch.setattr(alerts, "push", lambda text: pushed.append(text) or True)
+
+    alerts._flush_pending(force=True)
+    assert len(pushed) == 1
+    assert alerts._pending_alerts == []

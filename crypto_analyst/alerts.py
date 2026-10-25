@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
 from datetime import datetime
 from typing import Any
@@ -12,6 +13,18 @@ from typing import Any
 import requests
 
 from . import analysis, config, history
+
+logger = logging.getLogger(__name__)
+
+# 告警聚合：非关键告警在缓存窗口内合并推送，避免刷屏
+AGGREGATION_WINDOW = 5 * 60
+# 分级升级：同一标的在窗口内累计 N 条 warning 后，本轮告警自动升级为 critical
+ESCALATION_THRESHOLD = 3
+ESCALATION_WINDOW = 30 * 60
+
+_pending_alerts: list[dict[str, Any]] = []
+_last_batch_push = 0.0
+_warning_counts: dict[str, list[float]] = {}
 
 
 def _state_path():
@@ -26,7 +39,7 @@ def _load_state() -> dict[str, float]:
     try:
         return json.loads(path.read_text("utf-8"))
     except (OSError, ValueError) as exc:
-        print(f"[告警] 状态文件损坏，已重置冷却记录：{path}（{exc}）")
+        logger.warning("状态文件损坏，已重置冷却记录：%s（%s）", path, exc)
         return {}
 
 
@@ -209,7 +222,7 @@ def _is_feishu(url: str) -> bool:
 def _send(payload: dict[str, Any]) -> bool:
     """发送 Webhook 请求，自动处理加签与错误码。"""
     if not config.WEBHOOK_URL:
-        print("[推送跳过] 未配置 WEBHOOK_URL")
+        logger.info("推送跳过：未配置 WEBHOOK_URL")
         return False
     if config.WEBHOOK_SECRET:
         timestamp = str(int(time.time()))
@@ -225,11 +238,11 @@ def _send(payload: dict[str, Any]) -> bool:
         code = data.get("code", data.get("errcode", data.get("StatusCode")))
         if resp.status_code >= 400 or (code is not None and code != 0):
             reason = data.get("msg") or data.get("StatusMessage") or resp.text[:200]
-            print(f"[推送失败] HTTP {resp.status_code} code={code} {reason}")
+            logger.warning("推送失败 HTTP %s code=%s %s", resp.status_code, code, reason)
             return False
         return True
     except Exception as exc:
-        print(f"[推送失败] {exc}")
+        logger.warning("推送失败：%s", exc)
         return False
 
 
@@ -442,43 +455,88 @@ def pushable(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [item for item in alerts if LEVEL_ORDER.get(item.get("level", "info"), 1) >= threshold]
 
 
+def _escalate(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一标的在窗口期内累计达到阈值的 warning 后，升级为 critical。"""
+    now = time.time()
+    # 清理过期计数
+    for symbol in list(_warning_counts):
+        _warning_counts[symbol] = [t for t in _warning_counts[symbol] if now - t <= ESCALATION_WINDOW]
+        if not _warning_counts[symbol]:
+            del _warning_counts[symbol]
+
+    # 记录本轮 warning
+    for item in alerts:
+        if item.get("level") == "warning":
+            symbol = item.get("symbol", "")
+            _warning_counts.setdefault(symbol, []).append(now)
+
+    # 达到阈值的标的升级
+    escalated: list[dict[str, Any]] = []
+    for item in alerts:
+        symbol = item.get("symbol", "")
+        if len(_warning_counts.get(symbol, [])) >= ESCALATION_THRESHOLD:
+            item = dict(item)
+            item["level"] = "critical"
+            item["message"] = f"[升级] {item['message']}"
+        escalated.append(item)
+    return escalated
+
+
+def _flush_pending(force: bool = False) -> None:
+    """把缓存的告警批量推送；非强制时需等到聚合窗口结束。"""
+    global _last_batch_push
+    now = time.time()
+    if not _pending_alerts:
+        return
+    has_critical = any(a.get("level") == "critical" for a in _pending_alerts)
+    if not force and not has_critical and (now - _last_batch_push) < AGGREGATION_WINDOW:
+        return
+    due = pushable(_pending_alerts)
+    if due:
+        push(format_alerts(due))
+    _pending_alerts.clear()
+    _last_batch_push = now
+
+
 def run_watch_once() -> list[dict[str, Any]]:
     """跑一轮采集 + 告警评估 + 落盘/推送，供 watch 与内置调度共用。"""
     snapshot = analysis.build_snapshot(include_news=False, source="watch")
     fired = evaluate(snapshot)
+    fired = _escalate(fired)
     text = format_alerts(fired)
-    print(text, flush=True)
+    logger.info("%s", text)
     if fired:
         append_alert_log(text)
         if in_quiet_hours():
-            print("[静默时段] 本轮告警已落盘，未推送。", flush=True)
+            logger.info("静默时段：本轮告警已落盘，未推送。")
         else:
-            due = pushable(fired)
-            if due:
-                push(format_alerts(due))
-            else:
-                print("[级别过滤] 告警均低于 ALERT_MIN_LEVEL，仅落盘。", flush=True)
+            _pending_alerts.extend(fired)
+            _flush_pending()
+    else:
+        # 无新告警时也尝试刷新缓存（把窗口内残留的告警推出去）
+        _flush_pending()
     return fired
 
 
 def run_watch(interval: int | None = None, once: bool = False) -> None:
     interval = interval or config.ALERT_INTERVAL
-    print(
-        f"异动监控启动，轮询间隔 {interval}s，冷却 {config.ALERT_COOLDOWN}s，"
-        f"静默时段 {config.ALERT_QUIET_HOURS or '未启用'}，最低推送级别 {config.ALERT_MIN_LEVEL}（Ctrl+C 退出）"
+    logger.info(
+        "异动监控启动，轮询间隔 %ss，冷却 %ss，静默时段 %s，最低推送级别 %s",
+        interval, config.ALERT_COOLDOWN, config.ALERT_QUIET_HOURS or "未启用", config.ALERT_MIN_LEVEL,
     )
     while True:
         try:
             run_watch_once()
         except KeyboardInterrupt:
-            print("\n已停止监控。")
+            logger.info("已停止监控。")
             return
         except Exception as exc:  # 单轮失败不影响后续轮询
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 本轮采集失败: {exc}")
+            logger.warning("本轮采集失败: %s", exc)
         if once:
+            _flush_pending(force=True)  # 单次模式强制推送缓冲告警
             return
         try:
             time.sleep(interval)
         except KeyboardInterrupt:
-            print("\n已停止监控。")
+            logger.info("已停止监控。")
             return

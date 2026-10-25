@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -14,9 +16,17 @@ from . import analysis, briefing, config, dashboard
 from .agent import MarketAnalyst
 from .llm import LLMError
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 MAX_BODY_BYTES = 64 * 1024
+# /ask 接口保护：限制并发 LLM 请求数与单次最长耗时，避免耗尽资源
+MAX_CONCURRENT_ASK = 2
+ASK_TIMEOUT_SECONDS = 60
+
+_ask_in_flight = 0
+_ask_lock = threading.Lock()
 
 
 def _response(payload: Any, status: int = 200) -> tuple[int, str, str]:
@@ -59,11 +69,12 @@ def dispatch(
 
     独立于 HTTP 服务器，便于单测直接调用。
     """
-    if not _authorized(headers):
-        return _response({"error": "unauthorized"}, 401)
-
+    # /health 始终公开，便于容器健康检查与外部探活
     if method == "GET" and path == "/health":
         return _response({"status": "ok", "exchange": config.EXCHANGE, "symbols": config.SYMBOLS})
+
+    if not _authorized(headers):
+        return _response({"error": "unauthorized"}, 401)
 
     if method == "GET" and path == "/snapshot":
         include_news = _first(query, "news", "0") not in ("0", "false", "no")
@@ -115,13 +126,51 @@ def dispatch(
         symbols = payload.get("symbols")
         if isinstance(symbols, str):
             symbols = _symbols(symbols)
+
+        # 并发限制：避免同时跑太多 LLM 请求耗尽资源
+        global _ask_in_flight
+        with _ask_lock:
+            if _ask_in_flight >= MAX_CONCURRENT_ASK:
+                return _response({"error": "问答服务繁忙，请稍后再试"}, 429)
+            _ask_in_flight += 1
+
         try:
-            answer = MarketAnalyst().ask(question, symbols=symbols)
+            answer = _ask_with_timeout(question, symbols)
+        except _AskTimeout:
+            return _response({"error": "回答超时，请稍后重试"}, 504)
         except LLMError as exc:
             return _response({"error": str(exc)}, 503)
+        finally:
+            with _ask_lock:
+                _ask_in_flight -= 1
+
         return _response({"question": question, "answer": answer})
 
     return _response({"error": "not found"}, 404)
+
+
+class _AskTimeout(Exception):
+    """问答操作超时。"""
+
+
+def _ask_with_timeout(question: str, symbols: list[str] | None) -> str:
+    """在独立线程中执行问答，超时抛出 _AskTimeout。"""
+    result: dict[str, Any] = {}
+
+    def run():
+        try:
+            result["answer"] = MarketAnalyst().ask(question, symbols=symbols)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(ASK_TIMEOUT_SECONDS)
+    if thread.is_alive():
+        raise _AskTimeout()
+    if "error" in result:
+        raise result["error"]
+    return result["answer"]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -159,21 +208,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"[API] {self.address_string()} {fmt % args}", flush=True)
+        logger.info("%s %s", self.address_string(), fmt % args)
 
 
 def serve(host: str | None = None, port: int | None = None) -> None:
     host = host or config.API_HOST
     port = port or config.API_PORT
     server = ThreadingHTTPServer((host, port), _Handler)
-    print(
-        f"本地 API 已启动：http://{host}:{port}  "
-        f"（/health /snapshot /dashboard /brief /ask，鉴权 {'开启' if config.API_TOKEN else '关闭'}，Ctrl+C 退出）",
-        flush=True,
+    logger.info(
+        "本地 API 已启动：http://%s:%s （/health /snapshot /dashboard /brief /ask，鉴权 %s）",
+        host, port, "开启" if config.API_TOKEN else "关闭",
     )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nAPI 已停止。", flush=True)
+        logger.info("API 已停止。")
     finally:
         server.server_close()
