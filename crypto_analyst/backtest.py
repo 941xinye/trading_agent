@@ -35,6 +35,18 @@ MAX_DIM_WEIGHT = 0.50
 # 权重建议所需的最少有效窗口数，与回测结论口径保持一致
 MIN_RECOMMEND_SAMPLES = 30
 
+# ============ 策略回测参数 ============
+# 开仓阈值：综合分 ≥ 此值做多，≤ 此值做空
+LONG_THRESHOLD = 62.0
+SHORT_THRESHOLD = 38.0
+# 平仓中性区间：多头在分数跌破此值时平仓，空头在分数涨破此值时平仓
+NEUTRAL_HIGH = 55.0
+NEUTRAL_LOW = 45.0
+# 止损比例（相对开仓价）
+STOP_LOSS_PCT = 0.03
+# 最大持仓时长（小时），超时强制平仓
+MAX_HOLD_HOURS = 24.0
+
 
 def _pearson(xs: list[float], ys: list[float]) -> float | None:
     n = len(xs)
@@ -499,11 +511,242 @@ def _recommend_section(records: list[dict[str, Any]], horizon_hours: float) -> l
     return lines
 
 
+def run_strategy(
+    records: list[dict[str, Any]],
+    horizon_hours: float = 24.0,
+) -> dict[str, Any]:
+    """基于评分阈值的策略回测：高分做多、低分做空、回到中性区间平仓。
+
+    返回净值曲线、最大回撤、夏普比率、交易次数、胜率等关键指标。
+    每个标的独立模拟，净值曲线为等权合成。
+    """
+    by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for rec in records:
+        if rec.get("epoch") is not None and rec.get("price") and rec.get("total_score") is not None:
+            by_symbol[rec["symbol"]].append(rec)
+
+    all_trades: list[dict[str, Any]] = []
+    equity_points: list[tuple[float, float]] = []  # (epoch, cumulative_return_pct)
+    symbol_equity: dict[str, list[tuple[float, float]]] = {}
+
+    for symbol, recs in by_symbol.items():
+        recs.sort(key=lambda r: r["epoch"])
+        position: str | None = None  # "long" / "short" / None
+        entry_price = 0.0
+        entry_epoch = 0.0
+        peak_equity = 0.0
+        cum_return = 0.0  # 累计收益（百分比，单利累加）
+        points: list[tuple[float, float]] = []
+
+        for rec in recs:
+            price = float(rec["price"])
+            score = float(rec["total_score"])
+            epoch = float(rec["epoch"])
+
+            if position == "long":
+                pnl_pct = (price / entry_price - 1.0) * 100.0
+                hold_hours = (epoch - entry_epoch) / 3600.0
+                stop = pnl_pct <= -STOP_LOSS_PCT * 100.0
+                exit_signal = score < NEUTRAL_LOW
+                timeout = hold_hours >= MAX_HOLD_HOURS
+                if stop or exit_signal or timeout:
+                    all_trades.append({
+                        "symbol": symbol, "side": "long",
+                        "entry_price": entry_price, "exit_price": price,
+                        "return_pct": pnl_pct, "hold_hours": hold_hours,
+                        "exit_reason": "止损" if stop else ("信号平仓" if exit_signal else "超时"),
+                    })
+                    cum_return += pnl_pct
+                    position = None
+            elif position == "short":
+                pnl_pct = (entry_price / price - 1.0) * 100.0
+                hold_hours = (epoch - entry_epoch) / 3600.0
+                stop = pnl_pct <= -STOP_LOSS_PCT * 100.0
+                exit_signal = score > NEUTRAL_HIGH
+                timeout = hold_hours >= MAX_HOLD_HOURS
+                if stop or exit_signal or timeout:
+                    all_trades.append({
+                        "symbol": symbol, "side": "short",
+                        "entry_price": entry_price, "exit_price": price,
+                        "return_pct": pnl_pct, "hold_hours": hold_hours,
+                        "exit_reason": "止损" if stop else ("信号平仓" if exit_signal else "超时"),
+                    })
+                    cum_return += pnl_pct
+                    position = None
+
+            # 开仓
+            if position is None:
+                if score >= LONG_THRESHOLD:
+                    position = "long"
+                    entry_price = price
+                    entry_epoch = epoch
+                elif score <= SHORT_THRESHOLD:
+                    position = "short"
+                    entry_price = price
+                    entry_epoch = epoch
+
+            points.append((epoch, cum_return))
+
+        # 收盘平仓（最后一笔未平的持仓按最后价格结算）
+        if position is not None:
+            last = recs[-1]
+            price = float(last["price"])
+            if position == "long":
+                pnl_pct = (price / entry_price - 1.0) * 100.0
+            else:
+                pnl_pct = (entry_price / price - 1.0) * 100.0
+            all_trades.append({
+                "symbol": symbol, "side": position,
+                "entry_price": entry_price, "exit_price": price,
+                "return_pct": pnl_pct,
+                "hold_hours": (float(last["epoch"]) - entry_epoch) / 3600.0,
+                "exit_reason": "收盘",
+            })
+            cum_return += pnl_pct
+            points.append((float(last["epoch"]), cum_return))
+
+        symbol_equity[symbol] = points
+
+    # 合成净值曲线（按时间等权平均各标的累计收益）
+    all_epochs = sorted({ep for points in symbol_equity.values() for ep, _ in points})
+    if not all_epochs:
+        return {
+            "trades": all_trades, "num_trades": 0, "win_rate": None,
+            "avg_return": None, "total_return": 0.0, "max_drawdown": 0.0,
+            "sharpe": None, "equity": [],
+        }
+
+    running: dict[str, float] = {symbol: 0.0 for symbol in symbol_equity}
+    indices: dict[str, int] = {symbol: 0 for symbol in symbol_equity}
+    for epoch in all_epochs:
+        for symbol, points in symbol_equity.items():
+            idx = indices[symbol]
+            while idx + 1 < len(points) and points[idx + 1][0] <= epoch:
+                idx += 1
+            running[symbol] = points[idx][1]
+            indices[symbol] = idx
+        avg = sum(running.values()) / len(running)
+        equity_points.append((epoch, avg))
+
+    returns = [t["return_pct"] for t in all_trades]
+    wins = [r for r in returns if r > 0]
+    num_trades = len(returns)
+    avg_return = sum(returns) / num_trades if num_trades else 0.0
+    win_rate = len(wins) / num_trades * 100.0 if num_trades else None
+
+    # 最大回撤
+    max_dd = 0.0
+    peak = 0.0
+    for _ep, cum in equity_points:
+        peak = max(peak, cum)
+        dd = peak - cum
+        max_dd = max(max_dd, dd)
+
+    # 夏普比率（按交易次数年化，假设无风险利率为 0）
+    sharpe = None
+    if num_trades >= 2:
+        mean_r = avg_return
+        variance = sum((r - mean_r) ** 2 for r in returns) / (num_trades - 1)
+        std_r = variance ** 0.5
+        if std_r > 0:
+            # 年化：假设平均持仓时长对应每年可交易次数
+            avg_hold = sum(t["hold_hours"] for t in all_trades) / num_trades
+            trades_per_year = 365.0 * 24.0 / max(avg_hold, 1.0)
+            sharpe = mean_r / std_r * (trades_per_year ** 0.5)
+
+    total_return = sum(returns)
+
+    return {
+        "trades": all_trades,
+        "num_trades": num_trades,
+        "win_rate": win_rate,
+        "avg_return": avg_return,
+        "total_return": total_return,
+        "max_drawdown": max_dd,
+        "sharpe": sharpe,
+        "equity": equity_points,
+        "long_trades": sum(1 for t in all_trades if t["side"] == "long"),
+        "short_trades": sum(1 for t in all_trades if t["side"] == "short"),
+    }
+
+
+def _strategy_section(records: list[dict[str, Any]], horizon_hours: float) -> list[str]:
+    result = run_strategy(records, horizon_hours)
+    lines: list[str] = [f"### 策略回测 · 阈值多空 · 未来 {horizon_hours:g}h", ""]
+    if result["num_trades"] == 0:
+        lines.append(
+            f"无交易信号（需综合分 ≥ {LONG_THRESHOLD:.0f} 或 ≤ {SHORT_THRESHOLD:.0f}）。"
+            "当前样本可能集中在中性区间，继续积累数据。"
+        )
+        lines.append("")
+        return lines
+
+    lines.append(
+        f"交易 {result['num_trades']} 笔（多 {result['long_trades']} / 空 {result['short_trades']}）"
+        f" ｜ 总收益 {result['total_return']:+.2f}% ｜ 平均单笔 {result['avg_return']:+.2f}%"
+    )
+    wr = f"{result['win_rate']:.0f}%" if result["win_rate"] is not None else "—"
+    sharpe = f"{result['sharpe']:.2f}" if result["sharpe"] is not None else "—"
+    lines.append(f"胜率 {wr} ｜ 最大回撤 {result['max_drawdown']:.2f}% ｜ 年化夏普 {sharpe}")
+    lines.append("")
+    lines.append(
+        f"策略规则：综合分 ≥ {LONG_THRESHOLD:.0f} 做多 / ≤ {SHORT_THRESHOLD:.0f} 做空，"
+        f"分数回到 {NEUTRAL_LOW:.0f}-{NEUTRAL_HIGH:.0f} 区间平仓，"
+        f"止损 {STOP_LOSS_PCT:.0%}，最长持仓 {MAX_HOLD_HOURS:.0f}h。"
+    )
+    lines.append("")
+    return lines
+
+
+def apply_weights(weights: dict[str, float]) -> tuple[bool, str]:
+    """把推荐权重写入 config.py 的 DIMENSION_WEIGHTS，写入前自动备份。
+
+    返回 (是否成功, 消息)。仅在 recommend_weights 返回 ready=True 时调用。
+    """
+    import re
+    import shutil
+
+    config_path = config.BASE_DIR / "crypto_analyst" / "config.py"
+    if not config_path.exists():
+        return False, f"未找到 config.py：{config_path}"
+
+    # 备份
+    backup_path = config_path.with_suffix(".py.bak")
+    try:
+        shutil.copy2(config_path, backup_path)
+    except OSError as exc:
+        return False, f"备份 config.py 失败：{exc}"
+
+    content = config_path.read_text("utf-8")
+    body_lines = [f'    "{dim}": {weights[dim]:.2f},' for dim in config.DIMENSION_WEIGHTS]
+    replacement = "DIMENSION_WEIGHTS = {\n" + "\n".join(body_lines) + "\n}"
+
+    pattern = re.compile(r"DIMENSION_WEIGHTS\s*=\s*\{[^}]*\}", re.DOTALL)
+    match = pattern.search(content)
+    if not match:
+        return False, "未在 config.py 中找到 DIMENSION_WEIGHTS 定义"
+
+    if match.group(0).strip() == replacement.strip():
+        return False, "权重未发生变化"
+
+    new_content = pattern.sub(replacement, content, count=1)
+
+    try:
+        config_path.write_text(new_content, "utf-8")
+    except OSError as exc:
+        # 回滚
+        shutil.copy2(backup_path, config_path)
+        return False, f"写入 config.py 失败，已回滚：{exc}"
+
+    return True, f"权重已写入 {config_path}（备份：{backup_path.name}）"
+
+
 def run(
     horizon_hours: float | Iterable[float] = 24.0,
     source: str = "watch",
     sweep_weights: bool = False,
     recommend: bool = False,
+    strategy: bool = False,
     records: list[dict[str, Any]] | None = None,
 ) -> str:
     horizons = _normalize_horizons(horizon_hours)
@@ -550,4 +793,8 @@ def run(
         lines.append("")
         for horizon in horizons:
             lines.extend(_recommend_section(records, horizon))
+    if strategy:
+        lines.append("")
+        for horizon in horizons:
+            lines.extend(_strategy_section(records, horizon))
     return "\n".join(lines)

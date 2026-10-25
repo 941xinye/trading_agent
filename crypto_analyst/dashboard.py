@@ -20,6 +20,13 @@ DIMENSION_LABELS = {
     "sentiment": "情绪",
     "macro": "宏观",
 }
+DIMENSION_COLORS = {
+    "technical": "#38bdf8",
+    "positioning": "#a78bfa",
+    "liquidity": "#34d399",
+    "sentiment": "#fbbf24",
+    "macro": "#fb7185",
+}
 REGIME_COLORS = {
     "强势多头": "#22c55e",
     "偏多": "#4ade80",
@@ -51,7 +58,7 @@ def _price(value: float | None) -> str:
     return f"{value:.4f}"
 
 
-def _sparkline(values: list[float], gid: str, color: str) -> str:
+def _sparkline(values: list[float], gid: str, color: str, markers: list[int] | None = None) -> str:
     if not values:
         return ""
     if len(values) == 1:
@@ -68,6 +75,12 @@ def _sparkline(values: list[float], gid: str, color: str) -> str:
     line = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
     area = f"{pad:.1f},{height - pad:.1f} " + line + f" {width - pad:.1f},{height - pad:.1f}"
     last_x, last_y = points[-1]
+    marker_dots = ""
+    if markers:
+        for idx in markers:
+            if 0 <= idx < len(points):
+                mx, my = points[idx]
+                marker_dots += f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="5" fill="none" stroke="#fbbf24" stroke-width="2"/>'
     return f"""<svg class="spark" viewBox="0 0 {width:.0f} {height:.0f}" preserveAspectRatio="none" role="img">
       <defs>
         <linearGradient id="g{gid}" x1="0" y1="0" x2="0" y2="1">
@@ -77,10 +90,59 @@ def _sparkline(values: list[float], gid: str, color: str) -> str:
       </defs>
       <polygon points="{area}" fill="url(#g{gid})"/>
       <polyline points="{line}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+      {marker_dots}
       <circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4" fill="{color}"/>
       <text x="{width - pad - 2}" y="{pad + 10}" text-anchor="end" class="axis">{high:.0f}</text>
       <text x="{width - pad - 2}" y="{height - pad - 4}" text-anchor="end" class="axis">{low:.0f}</text>
     </svg>"""
+
+
+def _dimension_lines(rows: list[dict[str, Any]], gid: str) -> str:
+    """五维评分走势折线图：同一坐标系叠加技术/持仓/流动性/情绪/宏观五条线。"""
+    width, height, pad = 560.0, 120.0, 16.0
+    # 收集所有维度分数，统一 Y 轴范围
+    all_values: list[float] = []
+    series: dict[str, list[float]] = {}
+    for dim in DIMENSION_LABELS:
+        values = [float(row.get("scores", {}).get(dim, 50.0)) for row in rows]
+        series[dim] = values
+        all_values.extend(values)
+    if not all_values:
+        return ""
+    low, high = min(all_values), max(all_values)
+    if high - low < 1:
+        low, high = low - 1, high + 1
+    n = len(rows)
+    if n < 2:
+        n = 2
+    step = (width - 2 * pad) / (n - 1)
+
+    lines = []
+    for dim, label in DIMENSION_LABELS.items():
+        values = series[dim]
+        if len(values) == 1:
+            values = values * 2
+        pts = [
+            (pad + i * step, height - pad - (v - low) / (high - low) * (height - 2 * pad))
+            for i, v in enumerate(values)
+        ]
+        line = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+        color = DIMENSION_COLORS[dim]
+        lines.append(
+            f'<polyline points="{line}" fill="none" stroke="{color}" stroke-width="2" '
+            f'stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+
+    legend = "".join(
+        f'<span style="color:{DIMENSION_COLORS[d]}">{label}</span>'
+        for d, label in DIMENSION_LABELS.items()
+    )
+    return f"""<svg class="dims" viewBox="0 0 {width:.0f} {height:.0f}" preserveAspectRatio="none" role="img">
+      {''.join(lines)}
+      <text x="{width - pad - 2}" y="{pad + 8}" text-anchor="end" class="axis">{high:.0f}</text>
+      <text x="{width - pad - 2}" y="{height - pad - 4}" text-anchor="end" class="axis">{low:.0f}</text>
+    </svg>
+    <div class="legend">{legend}</div>"""
 
 
 def _bars(scores: dict[str, float]) -> str:
@@ -97,6 +159,18 @@ def _bars(scores: dict[str, float]) -> str:
     return "".join(rows)
 
 
+def _regime_change_markers(rows: list[dict[str, Any]]) -> list[int]:
+    """返回状态发生切换的快照索引，用于在综合分走势上标注。"""
+    markers: list[int] = []
+    prev_regime = None
+    for i, row in enumerate(rows):
+        regime = row.get("regime")
+        if prev_regime is not None and regime and regime != prev_regime:
+            markers.append(i)
+        prev_regime = regime
+    return markers
+
+
 def _card(symbol: str, rows: list[dict[str, Any]]) -> str:
     latest = rows[-1]
     first = rows[0]
@@ -108,6 +182,8 @@ def _card(symbol: str, rows: list[dict[str, Any]]) -> str:
     change_text = f"{change_24h:+.2f}%" if change_24h is not None else "—"
     change_class = "up" if (change_24h or 0) > 0 else ("down" if (change_24h or 0) < 0 else "flat")
     gid = "".join(ch for ch in symbol if ch.isalnum())
+    markers = _regime_change_markers(rows)
+    marker_note = f'<div class="marker-note">● 状态切换 {len(markers)} 次</div>' if markers else ""
     return f"""<section class="card">
       <header>
         <div>
@@ -120,7 +196,10 @@ def _card(symbol: str, rows: list[dict[str, Any]]) -> str:
         </div>
       </header>
       <div class="price">最新价 {_price(latest["price"])} <span class="{change_class}">{change_text}</span></div>
-      {_sparkline([float(row["total_score"]) for row in rows], gid, color)}
+      <div class="chart-label">综合分走势 {marker_note}</div>
+      {_sparkline([float(row["total_score"]) for row in rows], gid, color, markers=markers)}
+      <div class="chart-label">五维评分走势</div>
+      {_dimension_lines(rows, gid + "d")}
       <div class="bars">{_bars(latest.get("scores") or {})}</div>
     </section>"""
 
@@ -148,6 +227,12 @@ h1 { font-size: 26px; margin: 0 0 8px; letter-spacing: .5px; }
 .up { color: #4ade80; } .down { color: #fb7185; } .flat { color: #94a3b8; }
 .spark { width: 100%; height: 132px; display: block; }
 .axis { fill: #64748b; font-size: 11px; }
+.chart-label { font-size: 11px; color: #64748b; margin: 10px 0 2px; display: flex; justify-content: space-between; }
+.marker-note { color: #fbbf24; font-size: 11px; }
+.dims { width: 100%; height: 110px; display: block; margin-top: 2px; }
+.legend { display: flex; gap: 12px; font-size: 11px; margin-top: 2px; flex-wrap: wrap; }
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.legend span::before { content: ""; display: inline-block; width: 14px; height: 2px; background: currentColor; border-radius: 1px; }
 .bars { margin-top: 10px; display: grid; gap: 6px; }
 .row { display: grid; grid-template-columns: 52px 1fr 30px; align-items: center; gap: 8px;
   font-size: 12px; color: #a9b6c9; }

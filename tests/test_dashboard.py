@@ -61,3 +61,37 @@ def test_save_writes_html(tmp_path, monkeypatch):
     path = dashboard.save(out=str(tmp_path / "d.html"))
     assert Path(path).exists()
     assert "评分仪表盘" in Path(path).read_text("utf-8")
+
+
+def test_render_includes_dimension_lines(monkeypatch):
+    monkeypatch.setattr(dashboard.history, "iter_records", lambda: iter(_records()))
+    page = dashboard.render(days=7)
+    # 五维走势区域与图例
+    assert "五维评分走势" in page
+    assert "持仓面" in page
+    assert "流动性" in page
+    # 五条折线（每个维度一个 polyline，dims svg 内）
+    assert page.count("class=\"dims\"") >= 1
+
+
+def test_regime_change_markers_detected():
+    rows = [
+        {"regime": "震荡"},
+        {"regime": "震荡"},
+        {"regime": "偏空"},  # 切换
+        {"regime": "偏空"},
+        {"regime": "偏多"},  # 切换
+    ]
+    assert dashboard._regime_change_markers(rows) == [2, 4]
+
+
+def test_regime_change_markers_empty_when_stable():
+    rows = [{"regime": "震荡"}, {"regime": "震荡"}, {"regime": "震荡"}]
+    assert dashboard._regime_change_markers(rows) == []
+
+
+def test_sparkline_renders_markers():
+    values = [40.0, 42.0, 38.0, 45.0]
+    svg = dashboard._sparkline(values, "test", "#38bdf8", markers=[1, 3])
+    # 两个标记圆环
+    assert svg.count('stroke="#fbbf24"') == 2

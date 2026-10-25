@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 
 from . import analysis, alerts, backtest, briefing, config, net
 from .agent import MarketAnalyst
 from .llm import LLMError
 from .providers.exchanges import EXCHANGE_NAMES
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_symbols(value: str | None) -> list[str] | None:
@@ -87,6 +90,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="按各维度 IC 给出推荐权重（样本不足 30 个窗口时只展示 IC）",
     )
     p_backtest.add_argument(
+        "--apply",
+        action="store_true",
+        help="配合 --recommend 使用：把推荐权重直接写入 config.py（自动备份为 config.py.bak）",
+    )
+    p_backtest.add_argument(
+        "--strategy",
+        action="store_true",
+        help="附加策略回测：基于评分阈值做多/做空，输出净值、最大回撤、夏普比率",
+    )
+    p_backtest.add_argument(
         "--source",
         choices=["watch", "brief", "snapshot", "ask", "all"],
         default="watch",
@@ -141,7 +154,7 @@ def _cmd_brief(args: argparse.Namespace) -> int:
         if alerts.push_card(card):
             print("已推送到飞书。")
         else:
-            print("推送失败（简报已正常落盘），请检查 WEBHOOK_URL / WEBHOOK_SECRET 配置。", file=sys.stderr)
+            logger.warning("推送失败（简报已正常落盘），请检查 WEBHOOK_URL / WEBHOOK_SECRET 配置。")
             push_failed = True
     if snapshot.warnings:
         print("数据缺口：" + "；".join(snapshot.warnings))
@@ -249,9 +262,26 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             source=source,
             sweep_weights=args.sweep,
             recommend=args.recommend,
+            strategy=getattr(args, "strategy", False),
             records=records,
         )
     )
+
+    # --apply 必须配合 --recommend：把推荐权重写入 config.py
+    if getattr(args, "apply", False):
+        if not args.recommend:
+            print("--apply 需要配合 --recommend 使用。", file=sys.stderr)
+            return 1
+        all_records = records if records is not None else list(backtest.history.iter_records())
+        filtered = all_records if source == "all" else [r for r in all_records if r.get("source") == source]
+        result = backtest.recommend_weights(filtered, horizon_hours=horizons[0] if horizons else 24.0)
+        if not result["ready"]:
+            print("无法应用权重：" + result["note"], file=sys.stderr)
+            return 1
+        ok, message = backtest.apply_weights(result["suggested"])
+        print(message)
+        if not ok:
+            return 1
     return 0
 
 
@@ -318,6 +348,8 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError):
             pass
 
+    config.setup_logging()
+
     parser = _build_parser()
     args = parser.parse_args(argv)
     if not args.command:
@@ -326,15 +358,12 @@ def main(argv: list[str] | None = None) -> int:
 
     removed = net.prune_cache()
     if removed:
-        print(f"[缓存] 已清理 {removed} 个过期缓存文件", file=sys.stderr)
+        logger.info("已清理 %s 个过期缓存文件", removed)
 
     if getattr(args, "exchange", None):
         config.EXCHANGE = args.exchange
     if config.EXCHANGE not in EXCHANGE_NAMES:
-        print(
-            f"不支持的 EXCHANGE={config.EXCHANGE}，可选：{', '.join(EXCHANGE_NAMES)}",
-            file=sys.stderr,
-        )
+        logger.error("不支持的 EXCHANGE=%s，可选：%s", config.EXCHANGE, ", ".join(EXCHANGE_NAMES))
         return 1
 
     handlers = {

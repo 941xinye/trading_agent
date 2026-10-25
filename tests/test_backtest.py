@@ -49,6 +49,126 @@ def test_evaluate_pairs_filters_bad_records():
     assert len(backtest.evaluate_pairs(records, horizon_hours=24)) == 1
 
 
+def test_strategy_long_trade_profit():
+    # t0 评分 70 做多（100），t1 评分 40 平仓（105）→ 盈利 5%
+    records = [
+        _rec("BTC", 0.0, 100.0, 70.0),
+        _rec("BTC", 3600.0, 105.0, 40.0),
+    ]
+    result = backtest.run_strategy(records)
+    assert result["num_trades"] == 1
+    assert result["trades"][0]["side"] == "long"
+    assert result["trades"][0]["return_pct"] == pytest.approx(5.0)
+    assert result["total_return"] == pytest.approx(5.0)
+
+
+def test_strategy_short_trade_profit():
+    # t0 评分 30 做空（100），t1 评分 60 平仓（95）→ 做空盈利约 5.26%
+    records = [
+        _rec("BTC", 0.0, 100.0, 30.0),
+        _rec("BTC", 3600.0, 95.0, 60.0),
+    ]
+    result = backtest.run_strategy(records)
+    assert result["num_trades"] == 1
+    assert result["trades"][0]["side"] == "short"
+    assert result["trades"][0]["return_pct"] == pytest.approx((100.0 / 95.0 - 1.0) * 100.0, abs=0.01)
+
+
+def test_strategy_stop_loss():
+    # t0 评分 70 做多（100），t1 价格跌到 96（亏损 4% > 3% 止损），止损后信号仍在重新开仓
+    records = [
+        _rec("BTC", 0.0, 100.0, 70.0),
+        _rec("BTC", 1800.0, 96.0, 70.0),  # 评分仍高，止损后重新做多
+    ]
+    result = backtest.run_strategy(records)
+    stop_trades = [t for t in result["trades"] if t["exit_reason"] == "止损"]
+    assert len(stop_trades) == 1
+    assert stop_trades[0]["return_pct"] == pytest.approx(-4.0)
+    assert stop_trades[0]["side"] == "long"
+
+
+def test_strategy_no_trades_in_neutral_range():
+    # 所有评分在 45-55 中性区间，不开仓
+    records = [
+        _rec("BTC", 0.0, 100.0, 50.0),
+        _rec("BTC", 3600.0, 101.0, 52.0),
+        _rec("BTC", 7200.0, 100.5, 48.0),
+    ]
+    result = backtest.run_strategy(records)
+    assert result["num_trades"] == 0
+    assert result["total_return"] == 0.0
+
+
+def test_strategy_max_drawdown_calculated():
+    # 两笔交易：先赚 10%，再亏 5%，最大回撤应为 5%
+    records = [
+        _rec("BTC", 0.0, 100.0, 70.0),
+        _rec("BTC", 3600.0, 110.0, 40.0),  # 平仓赚 10%
+        _rec("BTC", 7200.0, 110.0, 30.0),  # 做空
+        _rec("BTC", 10800.0, 116.0, 60.0),  # 平仓亏约 5.17%
+    ]
+    result = backtest.run_strategy(records)
+    assert result["num_trades"] == 2
+    assert result["max_drawdown"] > 0
+    # 第一笔 +10%，第二笔约 -5.17%，回撤约 5.17%
+    assert result["max_drawdown"] == pytest.approx(5.17, abs=0.1)
+
+
+def test_strategy_closes_open_position_at_end():
+    # t0 做多 100，数据结束时仍持仓，按最后价格 108 收盘平仓
+    records = [
+        _rec("BTC", 0.0, 100.0, 70.0),
+        _rec("BTC", 3600.0, 108.0, 70.0),  # 评分仍高，未触发平仓
+    ]
+    result = backtest.run_strategy(records)
+    assert result["num_trades"] == 1
+    assert result["trades"][0]["exit_reason"] == "收盘"
+    assert result["trades"][0]["return_pct"] == pytest.approx(8.0)
+
+
+def test_apply_weights_writes_config_and_backups(tmp_path, monkeypatch):
+    # 构造一个假的 config.py
+    fake_config = tmp_path / "crypto_analyst"
+    fake_config.mkdir()
+    config_file = fake_config / "config.py"
+    config_file.write_text(
+        'DIMENSION_WEIGHTS = {\n    "technical": 0.40,\n    "positioning": 0.20,\n'
+        '    "liquidity": 0.15,\n    "sentiment": 0.15,\n    "macro": 0.10,\n}\n',
+        "utf-8",
+    )
+    monkeypatch.setattr(backtest.config, "BASE_DIR", tmp_path)
+
+    new_weights = {"technical": 0.35, "positioning": 0.25, "liquidity": 0.15, "sentiment": 0.15, "macro": 0.10}
+    ok, message = backtest.apply_weights(new_weights)
+
+    assert ok is True
+    assert "已写入" in message
+    # 备份文件存在
+    assert config_file.with_suffix(".py.bak").exists()
+    # 新权重写入成功
+    content = config_file.read_text("utf-8")
+    assert '"technical": 0.35' in content
+    assert '"positioning": 0.25' in content
+
+
+def test_apply_weights_returns_false_when_unchanged(tmp_path, monkeypatch):
+    fake_config = tmp_path / "crypto_analyst"
+    fake_config.mkdir()
+    config_file = fake_config / "config.py"
+    config_file.write_text(
+        'DIMENSION_WEIGHTS = {\n    "technical": 0.40,\n    "positioning": 0.20,\n'
+        '    "liquidity": 0.15,\n    "sentiment": 0.15,\n    "macro": 0.10,\n}\n',
+        "utf-8",
+    )
+    monkeypatch.setattr(backtest.config, "BASE_DIR", tmp_path)
+
+    same_weights = {"technical": 0.40, "positioning": 0.20, "liquidity": 0.15, "sentiment": 0.15, "macro": 0.10}
+    ok, message = backtest.apply_weights(same_weights)
+
+    assert ok is False
+    assert "未发生变化" in message
+
+
 def test_summarize_buckets_and_verdict_path():
     # 每个标的每 48h 一对记录：高分 BTC 随后 +10%，低分 ETH 随后 -10%
     records = []
