@@ -1,6 +1,8 @@
 """评分规则回归测试：把权重与阈值行为固化成基线，改动评分逻辑时必须同步更新。"""
 from __future__ import annotations
 
+import time
+
 from crypto_analyst import analysis, config
 from conftest import make_view
 
@@ -96,3 +98,23 @@ def test_flags_capture_overbought_and_funding_crowding():
     flags = analysis._build_flags("BTC", {"change_24h_pct": 1.0}, views, deriv, {"value": 50})
     assert any("超买区" in flag for flag in flags)
     assert any("多头拥挤" in flag for flag in flags)
+
+
+def test_normalize_ts_handles_seconds_and_milliseconds():
+    now = time.time()
+    assert analysis._normalize_ts(now) == now  # 秒级不变
+    assert analysis._normalize_ts(now * 1000) == now  # 毫秒级转秒
+
+
+def test_freshness_warnings_flags_stale_data():
+    now = time.time()
+    stale = {"1h": make_view("1h", last_ts=now - 5 * 3600)}  # 1h 数据过期 5 小时
+    fresh = {"1h": make_view("1h", last_ts=now - 600)}  # 10 分钟前，新鲜
+
+    assert analysis._freshness_warnings(stale)  # 有过期告警
+    assert not analysis._freshness_warnings(fresh)  # 无告警
+
+
+def test_freshness_warnings_skips_missing_timestamp():
+    views = {"1h": make_view("1h", last_ts=None)}
+    assert analysis._freshness_warnings(views) == []

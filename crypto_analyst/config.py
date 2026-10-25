@@ -1,13 +1,30 @@
 """全局配置：优先读环境变量 / .env，默认值按国内网络可达性选择数据源。"""
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
+
+
+def setup_logging() -> None:
+    """统一日志格式：[时间] [级别] [模块] 消息，输出到 stderr（daemon 会捕获到 watch.log）。"""
+    if logging.getLogger().handlers:
+        return  # 避免重复配置
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+    )
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.addHandler(handler)
 
 
 def _env_list(name: str, default: str) -> list[str]:

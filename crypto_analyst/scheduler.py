@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import alerts, briefing, config
+
+logger = logging.getLogger(__name__)
 
 CATCHUP_MINUTES = 30
 MAX_SLEEP_SECONDS = 20
@@ -79,14 +82,14 @@ def _run_brief(slot: str) -> bool:
     try:
         snapshot, _text, commentary, path = briefing.build()
         if not snapshot.symbols:
-            print(f"[{slot}] 简报未生成：未获取到任何标的。", flush=True)
+            logger.warning("[%s] 简报未生成：未获取到任何标的。", slot)
             return False
         card = alerts.build_brief_card(snapshot, commentary=commentary, report_path=path)
         ok = alerts.push_card(card)
-        print(f"[{slot}] 简报 {'已推送' if ok else '推送失败'}：{path}", flush=True)
+        logger.info("[%s] 简报%s：%s", slot, "已推送" if ok else "推送失败", path)
         return ok
     except Exception as exc:  # 单次失败不影响后续调度
-        print(f"[{slot}] 简报生成失败：{exc}", flush=True)
+        logger.warning("[%s] 简报生成失败：%s", slot, exc)
         return False
 
 
@@ -98,10 +101,10 @@ def serve(
     interval = interval or config.ALERT_INTERVAL
     slots = parse_times(times if times is not None else config.BRIEF_PUSH_TIMES)
     fired = _load_fired()
-    print(
-        f"内置调度启动：异动监控 {interval}s/轮，简报时间 {'/'.join(slots) or '未配置'}，"
-        f"静默时段 {config.ALERT_QUIET_HOURS or '未启用'}，最低推送级别 {config.ALERT_MIN_LEVEL}（Ctrl+C 退出）",
-        flush=True,
+    logger.info(
+        "内置调度启动：异动监控 %ss/轮，简报时间 %s，静默时段 %s，最低推送级别 %s",
+        interval, "/".join(slots) or "未配置",
+        config.ALERT_QUIET_HOURS or "未启用", config.ALERT_MIN_LEVEL,
     )
 
     next_watch = 0.0
@@ -111,7 +114,7 @@ def serve(
             try:
                 alerts.run_watch_once()
             except Exception as exc:  # 单轮采集失败不影响后续轮询
-                print(f"[{datetime.now():%H:%M:%S}] 本轮采集失败: {exc}", flush=True)
+                logger.warning("本轮采集失败: %s", exc)
             next_watch = time.time() + interval
 
         today = datetime.now().date().isoformat()
@@ -125,5 +128,5 @@ def serve(
         try:
             time.sleep(min(MAX_SLEEP_SECONDS, max(1.0, next_watch - time.time())))
         except KeyboardInterrupt:
-            print("\n已停止内置调度。", flush=True)
+            logger.info("已停止内置调度。")
             return

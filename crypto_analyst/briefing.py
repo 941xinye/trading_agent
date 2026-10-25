@@ -1,11 +1,13 @@
 """简报生成与落盘：CLI 与内置调度共用同一条链路，避免两处逻辑漂移。"""
 from __future__ import annotations
 
-import sys
+import logging
 
 from . import analysis, report
 from .agent import MarketAnalyst
 from .llm import LLMClient, LLMError
+
+logger = logging.getLogger(__name__)
 
 
 def build(
@@ -24,7 +26,7 @@ def build(
             try:
                 commentary = MarketAnalyst(llm).comment(report.facts_for_llm(snapshot))
             except LLMError as exc:
-                print(f"[提示] 分析师点评生成失败，仅输出规则部分：{exc}", file=sys.stderr)
+                logger.warning("分析师点评生成失败，仅输出规则部分：%s", exc)
 
     text = report.generate(
         snapshot,

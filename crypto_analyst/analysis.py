@@ -23,6 +23,32 @@ def _r(value: float | None, nd: int = 2) -> float | None:
     return None if value is None else round(float(value), nd)
 
 
+def _normalize_ts(ts: float) -> float:
+    """统一时间戳为秒：Binance 返回毫秒，Gate 返回秒，按数量级自动识别。"""
+    return ts / 1000.0 if ts > 1e12 else ts
+
+
+# 各周期数据新鲜度阈值（秒）：超过则视为数据过期，记入 warnings
+_TIMEFRAME_FRESHNESS = {"1h": 3 * 3600, "4h": 12 * 3600, "1d": 72 * 3600}
+
+
+def _freshness_warnings(views: dict[str, TimeframeView]) -> list[str]:
+    """检查各周期最新 K 线是否过期，返回告警文案列表。"""
+    import time
+
+    now = time.time()
+    warnings: list[str] = []
+    for timeframe, view in views.items():
+        if view.last_ts is None:
+            continue
+        age = now - view.last_ts
+        threshold = _TIMEFRAME_FRESHNESS.get(timeframe)
+        if threshold and age > threshold:
+            hours = age / 3600
+            warnings.append(f"{timeframe} K 线数据已过期 {hours:.1f} 小时（最后更新 {view.last_ts:.0f}）")
+    return warnings
+
+
 def regime_of(score: float) -> str:
     for threshold, label in REGIME_THRESHOLDS:
         if score >= threshold:
@@ -48,6 +74,7 @@ class TimeframeView:
     structure: str
     support: float | None
     resistance: float | None
+    last_ts: float | None = None  # 最新 K 线时间戳（秒），用于新鲜度校验
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -56,6 +83,7 @@ class TimeframeView:
         for key in ("macd_hist", "macd_hist_prev"):
             data[key] = _r(data[key], 4)
         data["change_pct"] = _r(data["change_pct"])
+        data.pop("last_ts", None)  # 内部字段不外泄
         return data
 
 
@@ -101,6 +129,7 @@ class MarketSnapshot:
     symbols: list[SymbolSnapshot]
     onchain: dict[str, Any]
     btc_network: dict[str, Any]
+    eth_network: dict[str, Any]
     sentiment: dict[str, Any]
     news: list[dict[str, Any]]
     macro: dict[str, Any]
@@ -112,6 +141,7 @@ class MarketSnapshot:
             "symbols": [s.to_dict() for s in self.symbols],
             "onchain": self.onchain,
             "btc_network": self.btc_network,
+            "eth_network": self.eth_network,
             "sentiment": {k: v for k, v in self.sentiment.items() if k != "history_30d"},
             "news": self.news,
             "macro": self.macro,
@@ -158,6 +188,7 @@ def build_timeframe_view(timeframe: str, candles: list[market.Candle]) -> Timefr
     lows = [c.low for c in candles]
     volumes = [c.quote_volume for c in candles]
     close = closes[-1]
+    last_ts = _normalize_ts(candles[-1].ts) if candles else None
 
     ema20_series = indicators.ema_series(closes, 20)
     ema50_series = indicators.ema_series(closes, 50)
@@ -206,6 +237,7 @@ def build_timeframe_view(timeframe: str, candles: list[market.Candle]) -> Timefr
         structure=_structure_of(highs[-80:], lows[-80:]),
         support=support,
         resistance=resistance,
+        last_ts=last_ts,
     )
 
 
@@ -436,9 +468,10 @@ def build_snapshot(
     symbols = [s.upper() for s in (symbols or config.SYMBOLS)]
     warnings: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=7) as pool:
         fut_stable = pool.submit(onchain.stablecoins)
         fut_btc = pool.submit(onchain.btc_network)
+        fut_eth = pool.submit(onchain.eth_network)
         fut_fng = pool.submit(sentiment.fear_greed)
         fut_macro = pool.submit(macro_provider.macro_overview)
         fut_news = pool.submit(sentiment.news) if include_news else None
@@ -454,6 +487,11 @@ def build_snapshot(
         except Exception as exc:
             btc = {}
             warnings.append(f"BTC 网络数据获取失败: {exc}")
+        try:
+            eth = fut_eth.result()
+        except Exception as exc:
+            eth = {}
+            warnings.append(f"ETH 网络数据获取失败: {exc}")
         try:
             fng = fut_fng.result()
         except Exception as exc:
@@ -481,12 +519,15 @@ def build_snapshot(
         results = list(pool.map(_safe, symbols))
 
     snapshots = [item for item in results if item is not None]
+    for item in snapshots:
+        warnings.extend(_freshness_warnings(item.timeframes))
     generated = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     snapshot = MarketSnapshot(
         generated_at=generated,
         symbols=snapshots,
         onchain=stable,
         btc_network=btc,
+        eth_network=eth,
         sentiment=fng,
         news=news_items,
         macro=macro_data,
