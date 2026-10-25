@@ -139,3 +139,36 @@ def get_text(url: str, ttl: int = 600, retries: int = 2) -> str:
     if ttl > 0:
         _save_cache(key, text)
     return text
+
+
+def post_json(
+    url: str,
+    payload: dict | None = None,
+    ttl: int = 60,
+    retries: int = 2,
+    timeout: float | None = None,
+) -> Any:
+    """POST JSON 并解析响应，缓存与重试策略同 get_json。"""
+    key = "post::" + url + ("::" + json.dumps(payload or {}, sort_keys=True))
+    if ttl > 0:
+        cached = _load_cache(key, ttl)
+        if cached is not None:
+            return cached
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            resp = _SESSION.post(
+                url,
+                json=payload,
+                timeout=timeout or config.HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if ttl > 0:
+                _save_cache(key, data)
+            return data
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(1.0 + attempt)
+    raise RuntimeError(f"POST 请求失败 {url}: {last_error}")

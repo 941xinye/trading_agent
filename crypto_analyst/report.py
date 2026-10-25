@@ -165,6 +165,22 @@ def _thermometer_rows(snapshot: analysis.MarketSnapshot) -> list[str]:
             rows.append(
                 f"| BTC 内存池 | {btc.get('mempool_size_mb')} MB | 快速费率 {btc.get('fee_fast_sat_vb')} sat/vB | 链上结算需求 |"
             )
+        diff_change = btc.get("diff_change_pct")
+        if diff_change is not None:
+            arrow = "↑" if diff_change > 0 else "↓"
+            rows.append(
+                f"| BTC 难度调整 | 预计 {arrow} {abs(diff_change):.2f}% | 上期 {btc.get('diff_prev_change_pct')}% | "
+                f"进度 {btc.get('diff_progress_pct')}% / 剩 {btc.get('diff_remaining_blocks')} 块 |"
+            )
+    eth = snapshot.eth_network
+    if eth and eth.get("gas_price_gwei") is not None:
+        congestion = "拥堵" if (eth.get("gas_used_ratio_avg") or 0) > 0.8 else (
+            "活跃" if (eth.get("gas_used_ratio_avg") or 0) > 0.5 else "冷清"
+        )
+        rows.append(
+            f"| ETH 网络 | gas {eth.get('gas_price_gwei')} Gwei | base fee {eth.get('base_fee_gwei')} Gwei | "
+            f"区块利用率 {eth.get('gas_used_ratio_avg')} · {congestion} |"
+        )
     return rows
 
 
@@ -285,7 +301,7 @@ def generate(
     source_text = f"{market.source_name()} 行情/永续"
     if note:
         source_text += f"（{note}）"
-    lines.append(f"**生成时间**：{snapshot.generated_at}　｜　**数据源**：{source_text} · DefiLlama 稳定币 · blockchain.info & mempool.space · alternative.me · 东方财富")
+    lines.append(f"**生成时间**：{snapshot.generated_at}　｜　**数据源**：{source_text} · DefiLlama 稳定币 · blockchain.info & mempool.space · Ethereum RPC · alternative.me · 东方财富")
     lines.append("")
     lines.append("## 一、结论速览")
     lines.append("")

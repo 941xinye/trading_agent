@@ -18,8 +18,8 @@
 | --- | --- | --- |
 | 技术面 | 1h/4h/1d K线、EMA20/50/200、RSI、MACD、ATR、布林带位置、量比、分形结构、摆动支撑阻力 | Gate.io / Binance 现货（可切换） |
 | 持仓面 | 资金费率及年化、90日分位、持仓量及1h/24h变化、账户多空比、大户多空比、爆仓量 | Gate.io / Binance 永续（可切换） |
-| 链上流动性 | 稳定币总供应及 1d/7d/30d 变化、BTC 算力/出块/内存池/手续费 | DefiLlama、blockchain.info、mempool.space |
-| 情绪面 | 恐慌贪婪指数（当前值、1d/7d 变化、30日均值）+ 加密快讯 | alternative.me、Cointelegraph/Decrypt RSS |
+| 链上流动性 | 稳定币总供应及 1d/7d/30d 变化、BTC 算力/出块/内存池/手续费/难度调整、ETH gas/base fee/区块利用率 | DefiLlama、blockchain.info、mempool.space、Ethereum 公共 RPC |
+| 情绪面 | 恐慌贪婪指数（当前值、1d/7d 变化、30日均值）+ 加密快讯（英文 RSS + 金色财经中文资讯/快讯） | alternative.me、Cointelegraph/Decrypt RSS、jinse.com.cn |
 | 宏观联动 | 美元指数、纳斯达克100、标普500 的点位与 1d/5d 涨跌 | 东方财富公开行情 |
 
 交互与推送通道全部实现：
@@ -360,12 +360,57 @@ powershell -File scripts\watch_stop.ps1
 - **调权重**：`config.DIMENSION_WEIGHTS` 与 `TIMEFRAME_WEIGHTS`。
 - **调阈值**：`config.THRESHOLDS`（RSI、资金费率、持仓量、量比、贴近价位、恐慌贪婪等信号/告警/评分共用，改一处全链路生效）。
 - **加告警规则**：在 `alerts.evaluate` 里 `add(key, level, message)`，自动享受冷却去重与推送。
-- **换中文新闻源**：替换 `providers/sentiment.py` 的 `RSS_FEEDS` 即可，解析逻辑通用。
+- **加新闻源**：`providers/sentiment.py` 中 `RSS_FEEDS`（RSS/Atom）、`JINSE_INFORMATION_URLS`（JSON API）、`JINSE_LIVES_URL`（HTML 快讯），解析逻辑分别在 `_parse_feed` / `_parse_jinse_information` / `_parse_jinse_lives`。
+
+## 八、Docker 部署
+
+仓库提供 `Dockerfile` 与 `docker-compose.yml`，可一键拉起常驻服务。镜像基于 `python:3.12-slim`，无需额外系统依赖。
+
+### 服务组成
+
+| 服务 | 命令 | 端口 | 说明 |
+| --- | --- | --- | --- |
+| `serve` | `main.py serve` | — | 异动监控 + 每日定时简报推送（主进程） |
+| `api` | `main.py api` | 8080 | 本地 HTTP API，带 `/health` 健康检查 |
+| `feishu` | `main.py feishu-hook` | 8787 | 飞书双向机器人回调（按需启用） |
+
+三个服务共享 `.cache` / `.state` / `reports` 三个命名卷，重启不丢数据。
+
+### 使用步骤
+
+```powershell
+# 1) 准备配置（从模板复制，按需填写 WEBHOOK_URL / LLM_API_KEY 等）
+copy .env.example .env
+
+# 2) 构建并启动（默认起 serve + api；feishu 按需启用）
+docker compose up -d --build
+
+# 3) 只启动飞书机器人
+docker compose up -d feishu
+
+# 4) 查看日志
+docker compose logs -f serve
+docker compose logs -f api
+
+# 5) 验证 API 健康
+curl.exe http://127.0.0.1:8080/health
+
+# 6) 停止
+docker compose down
+```
+
+### 注意事项
+
+- 时区默认 `Asia/Shanghai`，与 `BRIEF_PUSH_TIMES` 的本地时间一致；
+- `API_HOST` / `FEISHU_BOT_HOST` 在 compose 中已设为 `0.0.0.0`，容器内监听；对外暴露前务必在 `.env` 设置 `API_TOKEN`；
+- `/health` 接口始终公开（无需 token），便于容器健康检查与外部探活；
+- 若需访问 Binance 永续，在 `.env` 配置 `HTTPS_PROXY` 指向宿主机代理（注意 `127.0.0.1` 在容器内指向容器自身，需用宿主机局域网 IP 或 `host.docker.internal`）。
 
 ## 九、已知边界
 
 - **交易所净流入/流出**需要 CryptoQuant / Glassnode 付费 Key，当前用"稳定币供应 + 持仓结构"近似替代，需接入时在 `providers/onchain.py` 增加即可；
-- 新闻为英文 RSS（国内中文快讯接口多数需要签名鉴权），标题可直接交给 LLM 翻译与筛选；
+- 新闻来源为英文 RSS（Cointelegraph/Decrypt）+ 金色财经中文资讯与快讯，中文快讯通过 HTML 解析获取，页面结构变更可能导致解析失效（失败时自动跳过，不影响其他源）；
+- ETH 网络数据（gas/base fee）来自公共 RPC `ethereum-rpc.publicnode.com`，无 Key 但可能存在速率限制或短暂不可用，失败时该字段为空；
 - 资金费率分位基于当前所选交易所（Gate / Binance）永续近 90 天结算数据，不含其他交易所；
 - 回测基于落盘快照做"评分 vs 未来收益"的分桶统计与相关性检验，采用非重叠窗口采样（每窗口一个样本、允许 0.5×horizon 的价格滞后、断档窗口丢弃）。它只能回答"评分当时是否有预测力"，不能替代逐根 K 线的策略回测；后者可在 `backtest.py` 之上扩展。
 - 分位桶在样本 <5 个窗口时不输出，`--sweep` 在带分维度分数的快照 <3 条或无法算出基线 r 时直接跳过——样本越多，权重扫描的结论才越可信。

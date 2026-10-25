@@ -72,6 +72,7 @@ def make_snapshot(**kwargs) -> analysis.MarketSnapshot:
         symbols=[symbol],
         onchain=kwargs.pop("onchain", {"total_usd": 1.6e11, "change_7d_pct": 0.8, "change_30d_pct": 1.2}),
         btc_network=kwargs.pop("btc_network", {}),
+        eth_network=kwargs.pop("eth_network", {}),
         sentiment=kwargs.pop("sentiment", {"value": 50, "label": "中性", "change_1d": 0}),
         news=kwargs.pop("news", []),
         macro=kwargs.pop("macro", {}),

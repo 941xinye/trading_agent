@@ -1,9 +1,11 @@
-"""链上数据源：稳定币供应（场内增量资金）+ BTC 网络活动。"""
+"""链上数据源：稳定币供应（场内增量资金）+ BTC 网络活动 + ETH 网络拥堵。"""
 from __future__ import annotations
 
 from typing import Any
 
 from .. import net
+
+_ETH_RPC = "https://ethereum-rpc.publicnode.com"
 
 
 def stablecoins() -> dict[str, Any]:
@@ -43,7 +45,7 @@ def stablecoins() -> dict[str, Any]:
 
 
 def btc_network() -> dict[str, Any]:
-    """BTC 网络基本面：算力、交易笔数、出块时间、链上转账额、内存池拥堵。"""
+    """BTC 网络基本面：算力、交易笔数、出块时间、链上转账额、内存池拥堵、难度调整。"""
     stats = net.get_json("https://api.blockchain.info/stats", ttl=900, retries=1)
     network: dict[str, Any] = {
         "hash_rate_zh": (float(stats.get("hash_rate") or 0.0)) / 1e12,
@@ -56,6 +58,10 @@ def btc_network() -> dict[str, Any]:
         "difficulty": stats.get("difficulty"),
         "mempool_size_mb": None,
         "fee_fast_sat_vb": None,
+        "diff_change_pct": None,
+        "diff_prev_change_pct": None,
+        "diff_progress_pct": None,
+        "diff_remaining_blocks": None,
     }
     try:
         recommended = net.get_json(
@@ -64,6 +70,52 @@ def btc_network() -> dict[str, Any]:
         network["fee_fast_sat_vb"] = recommended.get("fastestFee")
         mempool = net.get_json("https://mempool.space/api/mempool", ttl=900, retries=1)
         network["mempool_size_mb"] = round(float(mempool.get("vsize", 0)) / 1e6, 2)
+        diff = net.get_json(
+            "https://mempool.space/api/v1/difficulty-adjustment", ttl=1800, retries=1
+        )
+        network["diff_change_pct"] = round(float(diff.get("difficultyChange") or 0.0), 2)
+        network["diff_prev_change_pct"] = round(float(diff.get("previousRetarget") or 0.0), 2)
+        network["diff_progress_pct"] = round(float(diff.get("progressPercent") or 0.0), 1)
+        network["diff_remaining_blocks"] = diff.get("remainingBlocks")
+    except RuntimeError:
+        pass
+    return network
+
+
+def _eth_rpc(method: str, params: list | None = None) -> Any:
+    """调用以太坊 JSON-RPC，返回 result 字段。"""
+    resp = net.post_json(
+        _ETH_RPC,
+        {"jsonrpc": "2.0", "method": method, "params": params or [], "id": 1},
+        ttl=120,
+        retries=1,
+    )
+    return resp.get("result")
+
+
+def eth_network() -> dict[str, Any]:
+    """ETH 网络拥堵：gas 价格、最近区块 base fee 与利用率。"""
+    network: dict[str, Any] = {
+        "gas_price_gwei": None,
+        "base_fee_gwei": None,
+        "gas_used_ratio_avg": None,
+        "latest_block": None,
+    }
+    try:
+        gas_hex = _eth_rpc("eth_gasPrice")
+        if gas_hex:
+            network["gas_price_gwei"] = round(int(gas_hex, 16) / 1e9, 2)
+        block_hex = _eth_rpc("eth_blockNumber")
+        if block_hex:
+            network["latest_block"] = int(block_hex, 16)
+        fee_hist = _eth_rpc("eth_feeHistory", ["0x5", "latest", []])
+        if fee_hist and fee_hist.get("baseFeePerGas"):
+            base_fees = [int(x, 16) for x in fee_hist["baseFeePerGas"] if x]
+            if base_fees:
+                network["base_fee_gwei"] = round(base_fees[-1] / 1e9, 2)
+            ratios = fee_hist.get("gasUsedRatio") or []
+            if ratios:
+                network["gas_used_ratio_avg"] = round(sum(ratios) / len(ratios), 3)
     except RuntimeError:
         pass
     return network

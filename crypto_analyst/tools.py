@@ -22,7 +22,13 @@ def set_symbol_scope(symbols: list[str] | None) -> list[str] | None:
 
 
 def _normalize_symbol(symbol: str) -> str:
-    return symbol.upper().replace("/", "").replace("-", "").replace(f"_{config.QUOTE}", "")
+    text = symbol.upper().replace("/", "").replace("-", "")
+    # 兼容 BTC_USDT / BTCUSDT / BTC-USDT 三种写法，剥离计价货币后缀
+    if text.endswith(f"_{config.QUOTE}"):
+        text = text[: -(len(config.QUOTE) + 1)]
+    elif text.endswith(config.QUOTE) and text != config.QUOTE:
+        text = text[: -len(config.QUOTE)]
+    return text
 
 
 def _get_snapshot() -> analysis.MarketSnapshot:
@@ -67,6 +73,7 @@ def _market_overview(symbols: list[str] | None = None) -> dict[str, Any]:
         "macro": snapshot.macro,
         "onchain": snapshot.onchain,
         "btc_network": snapshot.btc_network,
+        "eth_network": snapshot.eth_network,
         "warnings": snapshot.warnings,
     }
 
@@ -106,7 +113,11 @@ def _derivatives(symbol: str) -> dict[str, Any]:
 
 
 def _liquidity() -> dict[str, Any]:
-    return {"stablecoins": onchain.stablecoins(), "btc_network": onchain.btc_network()}
+    return {
+        "stablecoins": onchain.stablecoins(),
+        "btc_network": onchain.btc_network(),
+        "eth_network": onchain.eth_network(),
+    }
 
 
 def _sentiment_news(limit: int = 8) -> dict[str, Any]:

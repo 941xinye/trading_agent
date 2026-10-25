@@ -1,0 +1,62 @@
+services:
+  # 内置调度：异动监控 + 每日定时简报推送（常驻主进程）
+  serve:
+    build: .
+    container_name: chainlens-serve
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - chainlens-cache:/app/.cache
+      - chainlens-state:/app/.state
+      - chainlens-reports:/app/reports
+    command: ["python", "main.py", "serve"]
+
+  # 本地 HTTP API：/health /snapshot /dashboard /brief /ask
+  api:
+    build: .
+    container_name: chainlens-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+      - API_HOST=0.0.0.0
+      - API_PORT=8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - chainlens-cache:/app/.cache
+      - chainlens-state:/app/.state
+      - chainlens-reports:/app/reports
+    command: ["python", "main.py", "api"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # 飞书双向机器人事件回调（按需启用：docker compose up -d feishu）
+  # 需在飞书开放平台配置事件订阅地址指向 http://<你的域名>:8787/feishu/event
+  feishu:
+    build: .
+    container_name: chainlens-feishu
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+      - FEISHU_BOT_HOST=0.0.0.0
+      - FEISHU_BOT_PORT=8787
+    ports:
+      - "8787:8787"
+    volumes:
+      - chainlens-cache:/app/.cache
+      - chainlens-state:/app/.state
+      - chainlens-reports:/app/reports
+    command: ["python", "main.py", "feishu-hook"]
+
+volumes:
+  chainlens-cache:
+  chainlens-state:
+  chainlens-reports:
