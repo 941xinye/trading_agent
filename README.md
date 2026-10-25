@@ -27,7 +27,7 @@
 - **定时简报** `brief`：生成 Markdown 简报并落盘，结论速览自动带「较上次 / 较昨日」评分与状态变化；
 - **对话问答** `ask`：LLM 自主调用 7 个数据工具后作答；`ask -i` 进入多轮对话，上下文保留最近 3 轮；
 - **仪表盘** `dashboard`：把落盘快照渲染成静态 HTML（评分走势 + 五维拆解），本地直接打开；
-- **异动告警** `watch`：阈值触发 + 冷却去重 + Webhook 推送，覆盖 24h 异动 / RSI 超买卖 / 支撑阻力测试与突破 / 资金费率拥挤与极端分位 / 持仓量异动 / 量能放大 / 评分状态切换 / 恐慌贪婪极端值 / 稳定币流出；
+- **异动告警** `watch`：阈值触发 + 冷却去重 + 5 分钟聚合窗口与分级升级 + Webhook 推送，覆盖 24h 异动 / RSI 超买卖 / 支撑阻力测试与突破 / 资金费率拥挤与极端分位 / 持仓量异动 / 量能放大 / 评分状态切换 / 恐慌贪婪极端值 / 稳定币流出；
 - **本地 API** `api`：`/health`、`/snapshot`、`/dashboard`、`/brief`、`/ask` 五个接口，供本地页面或脚本调用；
 - **飞书双向** `feishu-hook`：自建应用订阅消息事件，群内 @机器人 直接提问并回复；
 - **飞书推送** `push-test` / `brief --push`：支持飞书自定义机器人 text 与 interactive 卡片消息，可选 HmacSHA256 加签。
@@ -158,6 +158,8 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 .venv\Scripts\python.exe main.py backtest --hours 4,24,72    # 多窗口对比
 .venv\Scripts\python.exe main.py backtest --sweep            # 附加权重敏感性扫描
 .venv\Scripts\python.exe main.py backtest --recommend        # 按各维度 IC 给出推荐权重（需 ≥30 个窗口）
+.venv\Scripts\python.exe main.py backtest --recommend --apply   # 推荐权重直接写入 config.py（自动备份为 config.py.bak）
+.venv\Scripts\python.exe main.py backtest --strategy           # 附加策略回测：评分阈值做多/做空，输出净值、最大回撤、夏普比率
 .venv\Scripts\python.exe main.py backtest --replay           # 历史重放：用近 28 天真实数据重建评分样本再回测（需联网）
 .venv\Scripts\python.exe main.py backtest --source all       # 全量来源（含 brief / ask / 调试快照）
 
@@ -196,6 +198,7 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 3. **收益质量**：Pearson r、Spearman IC（秩相关，抗极端值）、整体胜率、均盈/均亏、盈亏比、平均最大不利偏移（MAE，窗口内最低价相对入场价）；
 4. **权重敏感性**（`--sweep`）：各维度权重 ±5pp、其余维度等比缩放后重算总分，观察相关系数变化；某方向能明显提升 r，说明该维度权重偏低；
 5. **权重建议**（`--recommend`）：用同一批非重叠样本分别计算每个维度分数与未来收益的 Spearman IC。只有 IC 明显超出抽样噪声带（`1/√n`，且至少再高 5pp）的维度才参与权重分配，其余维度保留 5% 下限、单维度上限 50%，并输出可直接替换的 `DIMENSION_WEIGHTS` 代码块。有效窗口不足 30 个、或所有维度都只有噪声级 IC 时，只展示 IC 而不给建议。
+6. **策略回测**（`--strategy`）：按评分阈值模拟做多/做空（含止损比例与最长持仓限制），输出净值曲线、最大回撤、年化夏普、交易次数与胜率，用于回答"按综合分变色能不能赚钱"。
 
 ## 七、配置项（.env）
 
@@ -234,6 +237,7 @@ copy .env.example .env    # 按需填写 LLM_API_KEY
 | `FEISHU_VERIFY_TOKEN` | 空 | 事件订阅的 Verification Token，用于校验回调来源 |
 | `FEISHU_BOT_HOST` | `127.0.0.1` | 事件回调监听地址 |
 | `FEISHU_BOT_PORT` | `8787` | 事件回调端口 |
+| `LOG_LEVEL` | `INFO` | 日志级别（DEBUG/INFO/WARNING/ERROR）；daemon 日志输出到 reports/watch.log |
 
 ### 交易所切换
 
@@ -266,7 +270,7 @@ Binance 说明：
 
 ### 本地 API
 
-`api` 用标准库起的服务，默认 `127.0.0.1:8080`，不依赖额外包：
+`api` 用标准库起的服务，默认 `127.0.0.1:8080`，不依赖额外包；`/ask` 设有并发上限与超时保护，LLM 长耗时不会阻塞其他接口：
 
 | 接口 | 方法 | 说明 |
 | --- | --- | --- |
@@ -292,7 +296,7 @@ curl.exe -X POST "http://127.0.0.1:8080/ask" -H "Content-Type: application/json"
 2. 申请权限：接收消息（`im:message`）、以应用身份发消息（`im:message:send_as_bot`）；
 3. 事件订阅添加 `im.message.receive_v1`（接收消息），请求地址填 `https://你的域名/feishu/event`；本机可用内网穿透映射到 `8787`；
 4. 把 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_VERIFY_TOKEN` 填入 `.env`，启动 `main.py feishu-hook --port 8787`；
-5. 群里 @机器人 提问即可收到回答，单聊直接发消息也会回复；同一事件重推会自动去重。
+5. 群里 @机器人 提问即可收到回答，单聊直接发消息也会回复；同一事件重推会自动去重；同一会话（按 chat_id）保留上下文 30 分钟，可连续追问，超时未活跃自动清理。
 
 > 回调需要公网可达；LLM 回答通常超过飞书 3 秒超时，服务会先返回受理、再后台回答并回帖。暂不支持加密回调，请在后台关闭 Encrypt Key。
 
@@ -417,6 +421,7 @@ docker compose down
 - 回测只统计 `source=watch` 的记录（可用 `--source all` 放开），因此样本积累速度受 watch 运行时长限制：3 个标的每天最多 3 个 24h 窗口。
 - 多轮对话为进程内上下文，`Ctrl+C` / `/exit` 后不持久化；超过 25 条消息时从倒数第 3 轮开始截断，避免打断 tool_calls 与 tool 结果的配对。
 - 仪表盘只渲染落盘评分快照（综合分序列），不含 K 线行情；页面为单文件静态 HTML，内联 SVG，可离线归档。
+- 打分前会校验各周期 K 线最后时间戳的新鲜度，数据源返回过期缓存时按"数据缺口"处理并显式声明，不会用过期数据静默打分。
 
 ## 免责声明
 
