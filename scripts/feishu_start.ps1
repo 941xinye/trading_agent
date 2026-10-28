@@ -7,7 +7,7 @@
 #
 # 注意：
 #   - cpolar 免费版每次重启隧道都会更换随机域名，域名变更时脚本会显式提醒更新飞书后台；
-#   - 请在独立的 Windows PowerShell 窗口运行（Trae/VS Code 集成终端关闭会连带杀掉子进程）；
+#   - 服务经 WMI 启动，脱离当前终端会话存活（Trae/VS Code 集成终端关闭不影响）；
 #   - 服务日志：reports\feishu.log / reports\cpolar.log；cpolar 控制台：http://127.0.0.1:4040
 
 param(
@@ -71,11 +71,13 @@ if (Test-Port $Port) {
     Write-Host "[SKIP] 端口 $Port 已有 feishu-hook 在运行"
 } else {
     if (-not (Test-Path $Python)) { Write-Host "[ERR] 找不到虚拟环境：$Python"; exit 1 }
-    Start-Process -FilePath $Python `
-        -ArgumentList "main.py", "feishu-hook", "--host", "127.0.0.1", "--port", "$Port" `
-        -WorkingDirectory $Root -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $ReportDir "feishu.out.log") `
-        -RedirectStandardError  (Join-Path $ReportDir "feishu.log")
+    # 经 WMI 启动，进程脱离当前终端会话存活；输出重定向到日志
+    $FeishuLog = Join-Path $ReportDir "feishu.log"
+    $boot = "Set-Location '$Root'; & '$Python' main.py feishu-hook --host 127.0.0.1 --port $Port *> '$FeishuLog'"
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = "powershell.exe -NoProfile -WindowStyle Hidden -Command `"$boot`""
+    }
+    if ($r.ReturnValue -ne 0) { Write-Host "[ERR] WMI 启动 feishu-hook 失败：ReturnValue=$($r.ReturnValue)"; exit 1 }
     $ok = $false
     foreach ($i in 1..20) {
         Start-Sleep -Milliseconds 500
@@ -101,9 +103,12 @@ if (Get-Process cpolar -ErrorAction SilentlyContinue) {
     if (-not ($CpolarExe -and (Test-Path $CpolarExe))) {
         Write-Host "[ERR] 未找到 cpolar.exe，请用 -CpolarExe 参数指定路径"; exit 1
     }
-    Start-Process -FilePath $CpolarExe -ArgumentList "http", "$Port" -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $ReportDir "cpolar.log") `
-        -RedirectStandardError  (Join-Path $ReportDir "cpolar.err.log")
+    $CpolarLog = Join-Path $ReportDir "cpolar.log"
+    $boot2 = "& '$CpolarExe' http $Port *> '$CpolarLog'"
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = "powershell.exe -NoProfile -WindowStyle Hidden -Command `"$boot2`""
+    }
+    if ($r.ReturnValue -ne 0) { Write-Host "[ERR] WMI 启动 cpolar 失败：ReturnValue=$($r.ReturnValue)"; exit 1 }
     Write-Host "[OK] cpolar 隧道已启动，日志：reports\cpolar.log"
 }
 
