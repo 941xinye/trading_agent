@@ -150,19 +150,6 @@ def evaluate(snapshot: analysis.MarketSnapshot) -> list[dict[str, Any]]:
                 add(f"{symbol}:funding_hot", "warning", f"{symbol} 资金费率年化 {funding:.0f}%，多头拥挤")
             elif funding is not None and funding < th["funding_crowded_short"]:
                 add(f"{symbol}:funding_short", "info", f"{symbol} 资金费率年化 {funding:.0f}%，空头拥挤")
-            funding_pctl = deriv.get("funding_percentile")
-            if funding_pctl is not None and funding_pctl >= th["funding_pctl_hot"]:
-                add(
-                    f"{symbol}:funding_pctl_hot",
-                    "warning",
-                    f"{symbol} 资金费率历史分位 {funding_pctl:.0f}%，处于 90 日极端拥挤区间",
-                )
-            elif funding_pctl is not None and funding_pctl <= th["funding_pctl_cold"]:
-                add(
-                    f"{symbol}:funding_pctl_cold",
-                    "info",
-                    f"{symbol} 资金费率历史分位 {funding_pctl:.0f}%，处于 90 日极端冷清区间，警惕逼空",
-                )
             oi_change = deriv.get("oi_change_1h_pct")
             if oi_change is not None and abs(oi_change) >= th["oi_alert_pct"]:
                 direction = "增仓" if oi_change > 0 else "减仓"

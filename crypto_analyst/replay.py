@@ -217,7 +217,10 @@ def build_records(
     for symbol in symbols:
         candles = {
             timeframe: _candles(symbol, timeframe, _limit_for(timeframe))
+            # 回放不重建 5m 等短周期：交易所单次最多 1000 根（5m 仅约 3.5 天），
+            # 覆盖不了长回放窗口，且窗口间口径必须一致
             for timeframe in config.TIMEFRAMES
+            if timeframe in ("1h", "4h", "1d")
         }
         if "1h" not in candles or not candles["1h"]:
             continue

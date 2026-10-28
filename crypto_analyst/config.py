@@ -41,11 +41,11 @@ BINANCE_FUTURES_BASE = os.getenv("BINANCE_FUTURES_BASE", "https://fapi.binance.c
 # 标的与周期
 SYMBOLS = [s.upper() for s in _env_list("SYMBOLS", "BTC,ETH,SOL")]
 QUOTE = os.getenv("QUOTE", "USDT").upper()
-TIMEFRAMES = _env_list("TIMEFRAMES", "1h,4h,1d")
+TIMEFRAMES = _env_list("TIMEFRAMES", "5m,1h,4h,1d")
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "300"))
 
-# 周期权重：日线定方向，4h 定节奏，1h 找入场
-TIMEFRAME_WEIGHTS = {"1h": 0.20, "4h": 0.35, "1d": 0.45}
+# 周期权重：日线定方向，4h 定节奏，1h 找入场，5m 做入场微调
+TIMEFRAME_WEIGHTS = {"5m": 0.05, "1h": 0.15, "4h": 0.35, "1d": 0.45}
 
 # 五维评分权重（技术面 / 持仓面 / 流动性 / 情绪 / 宏观）
 DIMENSION_WEIGHTS = {
@@ -83,9 +83,6 @@ THRESHOLDS = {
     "fng_extreme_fear": 15,
     # 稳定币 7d 变化（%，流出告警）
     "stable_outflow_7d_pct": -1.0,
-    # 资金费率历史分位（%，极端拥挤告警）
-    "funding_pctl_hot": 90.0,
-    "funding_pctl_cold": 10.0,
 }
 
 # 网络与缓存

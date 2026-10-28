@@ -92,8 +92,8 @@ def _symbol_analysis(symbol: str) -> dict[str, Any]:
 
 def _klines(symbol: str, timeframe: str = "4h", limit: int = 120) -> dict[str, Any]:
     symbol = _normalize_symbol(symbol)
-    if timeframe not in {"1h", "4h", "1d"}:
-        raise ValueError("timeframe 仅支持 1h / 4h / 1d")
+    if timeframe not in {"5m", "1h", "4h", "1d"}:
+        raise ValueError("timeframe 仅支持 5m / 1h / 4h / 1d")
     candles = market.candles(symbol, timeframe, limit)
     view = analysis.build_timeframe_view(timeframe, candles)
     closes = [c.close for c in candles]
@@ -160,7 +160,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string", "description": "币种，如 BTC"},
-                    "timeframe": {"type": "string", "enum": ["1h", "4h", "1d"], "description": "周期，默认 4h"},
+                    "timeframe": {"type": "string", "enum": ["5m", "1h", "4h", "1d"], "description": "周期，默认 4h"},
                 },
                 "required": ["symbol"],
             },

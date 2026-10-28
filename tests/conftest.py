@@ -5,7 +5,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from crypto_analyst import analysis
+from crypto_analyst import analysis, config
+
+# 固定测试环境的周期列表，避免测试结果随用户 .env 漂移
+config.TIMEFRAMES = ["5m", "1h", "4h", "1d"]
 
 
 def make_view(timeframe: str, **overrides) -> analysis.TimeframeView:
@@ -34,6 +37,7 @@ def make_view(timeframe: str, **overrides) -> analysis.TimeframeView:
 
 def make_snapshot(**kwargs) -> analysis.MarketSnapshot:
     views = {
+        "5m": make_view("5m"),
         "1h": make_view("1h"),
         "4h": make_view("4h"),
         "1d": make_view("1d"),

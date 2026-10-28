@@ -29,7 +29,7 @@ def _normalize_ts(ts: float) -> float:
 
 
 # 各周期数据新鲜度阈值（秒）：超过则视为数据过期，记入 warnings
-_TIMEFRAME_FRESHNESS = {"1h": 3 * 3600, "4h": 12 * 3600, "1d": 72 * 3600}
+_TIMEFRAME_FRESHNESS = {"5m": 15 * 60, "1h": 3 * 3600, "4h": 12 * 3600, "1d": 72 * 3600}
 
 
 def _freshness_warnings(views: dict[str, TimeframeView]) -> list[str]:
